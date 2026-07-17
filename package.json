@@ -1,0 +1,30 @@
+{
+    "name": "garantor-contracts",
+    "version": "1.0.0",
+    "private": false,
+    "description": "Garantor DAO — on-chain escrow, milestone, jetton, and oracle-marketplace smart contracts (Tact / TON)",
+    "scripts": {
+        "build": "npx @ton/blueprint build EscrowFactory && npx @ton/blueprint build EscrowMilestoneFactory && npx @ton/blueprint build EscrowVault && npx @ton/blueprint build EscrowVaultMilestone",
+        "build:v2": "npx @ton/blueprint build EscrowJettonFactory && npx @ton/blueprint build EscrowJettonMilestoneFactory && npx @ton/blueprint build EscrowJettonVault && npx @ton/blueprint build EscrowJettonVaultMilestone",
+        "build:v3": "npx @ton/blueprint build OracleRegistry && npx @ton/blueprint build EscrowOracleVault && npx @ton/blueprint build MarketplaceListing && npx @ton/blueprint build MarketplaceFactory",
+        "build:all": "npx @ton/blueprint build --all",
+        "test": "jest"
+    },
+    "devDependencies": {
+        "@tact-lang/compiler": "1.6.13",
+        "@ton/blueprint": "0.44.0",
+        "@ton/core": "^0.63.1",
+        "@ton/sandbox": "^0.41.0",
+        "@ton/test-utils": "^0.12.0",
+        "@ton/ton": "^16.2.2",
+        "@types/jest": "^29.5.0",
+        "@types/node": "^22.0.0",
+        "jest": "^29.7.0",
+        "jest-environment-node": "^29.5.0",
+        "ton-emulator": "^2.1.1",
+        "ts-jest": "^29.1.0",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.9.3"
+    },
+    "keywords": ["ton", "blockchain", "escrow", "dao", "tact", "blueprint"]
+}

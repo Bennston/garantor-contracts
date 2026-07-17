@@ -1,0 +1,419 @@
+import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
+import { toNano, Address, beginCell, Cell } from '@ton/core';
+import { keyPairFromSeed, sign, KeyPair } from '@ton/crypto';
+import { EscrowOracleVault } from '../build/EscrowOracleVault/tact_EscrowOracleVault';
+import { OracleRegistry } from '../build/OracleRegistry/tact_OracleRegistry';
+import { MockJettonMaster } from '../build/MockJettonMaster/tact_MockJettonMaster';
+import { MockJettonWallet } from '../build/MockJettonMaster/tact_MockJettonWallet';
+import '@ton/test-utils';
+
+// USDT has 6 decimals.
+const USDT = (n: number) => BigInt(Math.round(n * 1_000_000));
+const TRADE = USDT(10);
+const GUARANTEE = USDT(0.2);          // 2% seller guarantee
+const COMMISSION = USDT(0.1);         // 1% platform commission
+const SELLER_PAYOUT = TRADE + GUARANTEE - COMMISSION;
+const POOL = TRADE + GUARANTEE;
+
+const VTYPE = 1;                       // this vault's expected validation type (e.g. "API check")
+const OBJECTION_WINDOW = 172800;       // 72h, must match the contract constant
+
+const DELIVERED = 0;
+const FAILED = 1;
+const PARTIAL = 2;
+
+const EMPTY_FWD = beginCell().storeUint(0, 1).endCell().asSlice();
+
+const bufToBigInt = (b: Buffer) => BigInt('0x' + b.toString('hex'));
+
+describe('EscrowOracleVault (V3 / DON-signed oracle settlement)', () => {
+    let blockchain: Blockchain;
+    let deployer: SandboxContract<TreasuryContract>;   // jetton minter
+    let dao: SandboxContract<TreasuryContract>;         // registry owner + vault owner
+    let commissionaires: SandboxContract<TreasuryContract>;
+    let factory: SandboxContract<TreasuryContract>;     // stands in for the listing/factory
+    let buyer: SandboxContract<TreasuryContract>;
+    let seller: SandboxContract<TreasuryContract>;
+    let relayer: SandboxContract<TreasuryContract>;     // untrusted — anyone may relay a signed report
+    let stranger: SandboxContract<TreasuryContract>;
+
+    let master: SandboxContract<MockJettonMaster>;
+    let registry: SandboxContract<OracleRegistry>;
+    let vault: SandboxContract<EscrowOracleVault>;
+
+    let donKey: KeyPair;      // trusted DON attestation bridge key
+    let wrongKey: KeyPair;    // an untrusted key
+    let NOW: number;
+
+    // Canonical report preimage — MUST match OracleRegistry.SubmitReport byte-for-byte.
+    const reportHash = (vaultAddr: Address, tradeId: bigint, vt: number, status: number, proof: Cell | null): Buffer => {
+        const proofHash = proof ? bufToBigInt(proof.hash()) : 0n;
+        return beginCell()
+            .storeAddress(vaultAddr)
+            .storeUint(tradeId, 64)
+            .storeUint(vt, 8)
+            .storeUint(status, 8)
+            .storeUint(proofHash, 256)
+            .endCell()
+            .hash();
+    };
+
+    const signWith = (kp: KeyPair, vaultAddr: Address, tradeId: bigint, vt: number, status: number, proof: Cell | null): Cell =>
+        beginCell().storeBuffer(sign(reportHash(vaultAddr, tradeId, vt, status, proof), kp.secretKey)).endCell();
+
+    const mint = async (to: Address, amount: bigint) =>
+        master.send(deployer.getSender(), { value: toNano('0.1') }, { $$type: 'MockMint', to, amount });
+
+    const walletOf = async (owner: Address) =>
+        blockchain.openContract(await MockJettonWallet.fromInit(owner, master.address));
+
+    const balanceOf = async (owner: Address): Promise<bigint> => {
+        const w = await walletOf(owner);
+        const state = await blockchain.getContract(w.address);
+        if (state.accountState?.type !== 'active') return 0n;
+        return await w.getBalance();
+    };
+
+    const depositJettons = async (owner: SandboxContract<TreasuryContract>, amount: bigint, target: Address = vault.address) => {
+        const w = await walletOf(owner.address);
+        return w.send(owner.getSender(), { value: toNano('0.3') }, {
+            $$type: 'JettonTransfer',
+            queryId: 0n,
+            amount,
+            destination: target,
+            responseDestination: owner.address,
+            customPayload: null,
+            forwardTonAmount: toNano('0.1'),
+            forwardPayload: EMPTY_FWD,
+        });
+    };
+
+    const fundBoth = async (target: Address = vault.address) => {
+        await depositJettons(buyer, TRADE, target);
+        await depositJettons(seller, GUARANTEE, target);
+    };
+
+    // Deploy + init a second vault pinned to a given settlement mode (0 oracle, 1 manual).
+    const initVaultWithMode = async (seqno: bigint, mode: number) => {
+        const v = blockchain.openContract(await EscrowOracleVault.fromInit(factory.address, dao.address, seqno));
+        await v.send(factory.getSender(), { value: toNano('0.7') }, {
+            $$type: 'InitVault',
+            buyer: buyer.address, seller: seller.address, jettonMaster: master.address,
+            tradeValue: TRADE, guaranteePercent: 2n, commissionPercent: 1n,
+            commissionairesDao: commissionaires.address, tradeId: seqno,
+            deadline: BigInt(NOW + 30 * 86400),
+            oracleRegistry: registry.address, validationType: BigInt(VTYPE),
+            agreementCID: null, settlementMode: BigInt(mode),
+        });
+        return v;
+    };
+
+    // Relay a DON-signed report through the registry. `signature` defaults to a
+    // valid DON signature over the same report; override to forge/tamper.
+    const submitReport = async (
+        who: SandboxContract<TreasuryContract>,
+        status: number,
+        validationType: number = VTYPE,
+        signature?: Cell,
+        proof: Cell | null = null,
+        target: Address = vault.address,
+        tradeId: bigint = 1n,
+    ) =>
+        registry.send(who.getSender(), { value: toNano('0.3') }, {
+            $$type: 'SubmitReport',
+            vault: target,
+            tradeId,
+            validationType: BigInt(validationType),
+            status: BigInt(status),
+            proof,
+            signature: signature ?? signWith(donKey, target, tradeId, validationType, status, proof),
+        });
+
+    const withdraw = async (who: SandboxContract<TreasuryContract>) =>
+        vault.send(who.getSender(), { value: toNano('0.15') }, { $$type: 'Withdraw' });
+
+    beforeEach(async () => {
+        blockchain = await Blockchain.create();
+        NOW = Math.floor(Date.now() / 1000);
+        blockchain.now = NOW;
+
+        donKey = keyPairFromSeed(Buffer.alloc(32, 7));
+        wrongKey = keyPairFromSeed(Buffer.alloc(32, 9));
+
+        deployer = await blockchain.treasury('deployer');
+        dao = await blockchain.treasury('dao');
+        commissionaires = await blockchain.treasury('commissionaires');
+        factory = await blockchain.treasury('factory');
+        buyer = await blockchain.treasury('buyer');
+        seller = await blockchain.treasury('seller');
+        relayer = await blockchain.treasury('relayer');
+        stranger = await blockchain.treasury('stranger');
+
+        const content = beginCell().storeUint(0, 8).storeBit(false).endCell();
+        master = blockchain.openContract(await MockJettonMaster.fromInit(deployer.address, content));
+        await mint(buyer.address, USDT(100));
+        await mint(seller.address, USDT(100));
+
+        // Registry holds the trusted DON attestation key; owner = dao.
+        registry = blockchain.openContract(await OracleRegistry.fromInit(dao.address, bufToBigInt(donKey.publicKey)));
+        await registry.send(dao.getSender(), { value: toNano('0.1') }, null);   // deploy (key set at init)
+
+        // Deploy + initialize the vault (test plays the listing/factory).
+        vault = blockchain.openContract(await EscrowOracleVault.fromInit(factory.address, dao.address, 1n));
+        await vault.send(factory.getSender(), { value: toNano('0.7') }, {
+            $$type: 'InitVault',
+            buyer: buyer.address,
+            seller: seller.address,
+            jettonMaster: master.address,
+            tradeValue: TRADE,
+            guaranteePercent: 2n,
+            commissionPercent: 1n,
+            commissionairesDao: commissionaires.address,
+            tradeId: 1n,
+            deadline: BigInt(NOW + 30 * 86400),
+            oracleRegistry: registry.address,
+            validationType: BigInt(VTYPE),
+            agreementCID: null,
+            settlementMode: 0n,   // oracle-only
+        });
+    });
+
+    it('initializes, resolves its jetton wallet, and records the oracle config', async () => {
+        expect(await vault.getWalletResolved()).toBe(true);
+        expect(await vault.getValidationType()).toBe(BigInt(VTYPE));
+        expect(await vault.getSettlementMode()).toBe(0n);   // oracle-only
+        expect((await vault.getOracleRegistryAddr()).equals(registry.address)).toBe(true);
+        expect(await vault.getObjectionDeadline()).toBe(0n);
+        expect((await vault.getVaultState()).state).toBe(1n);   // AWAITING_DEPOSITS
+        expect(await registry.getDonPublicKey()).toBe(bufToBigInt(donKey.publicKey));
+    });
+
+    it('rejects an OracleReport that does not come from the registry', async () => {
+        await fundBoth();
+        const res = await vault.send(stranger.getSender(), { value: toNano('0.1') }, {
+            $$type: 'OracleReport',
+            tradeId: 1n,
+            validationType: BigInt(VTYPE),
+            status: BigInt(DELIVERED),
+            proof: null,
+        });
+        expect(res.transactions).toHaveTransaction({
+            from: stranger.address, to: vault.address, success: false,   // sender() != oracleRegistry
+        });
+        expect(await vault.getObjectionDeadline()).toBe(0n);
+        expect((await vault.getVaultState()).state).toBe(2n);
+    });
+
+    it('registry rejects a report signed by the wrong key', async () => {
+        await fundBoth();
+        const forged = signWith(wrongKey, vault.address, 1n, VTYPE, DELIVERED, null);
+        const res = await submitReport(relayer, DELIVERED, VTYPE, forged);
+        expect(res.transactions).toHaveTransaction({
+            from: relayer.address, to: registry.address, success: false,   // Invalid DON signature
+        });
+        expect(await vault.getObjectionDeadline()).toBe(0n);
+    });
+
+    it('registry rejects a report whose status was tampered after signing', async () => {
+        await fundBoth();
+        // Legit signature for DELIVERED, but the submitted status is FAILED → hash mismatch.
+        const deliveredSig = signWith(donKey, vault.address, 1n, VTYPE, DELIVERED, null);
+        const res = await submitReport(relayer, FAILED, VTYPE, deliveredSig);
+        expect(res.transactions).toHaveTransaction({
+            from: relayer.address, to: registry.address, success: false,
+        });
+        expect((await vault.getVaultState()).state).toBe(2n);   // unchanged
+    });
+
+    it('vault rejects a validly-signed report whose type does not match its own', async () => {
+        await fundBoth();
+        // Signature is valid for type 2, but this vault expects VTYPE (1): registry
+        // forwards, the vault rejects on the type check.
+        const res = await submitReport(relayer, DELIVERED, 2);
+        expect(res.transactions).toHaveTransaction({
+            from: registry.address, to: vault.address, success: false,   // Validation type mismatch
+        });
+        expect(await vault.getObjectionDeadline()).toBe(0n);
+    });
+
+    it('any relayer can push a valid DON-signed Delivered report; it opens the window without paying out', async () => {
+        await fundBoth();
+        expect((await vault.getVaultState()).state).toBe(2n);
+
+        await submitReport(relayer, DELIVERED);   // relayer is NOT whitelisted — signature is the trust anchor
+
+        const st = await vault.getVaultState();
+        expect(st.state).toBe(2n);                 // still awaiting — no payout yet
+        expect(st.sellerClaimable).toBe(0n);
+        expect(st.commissionairesClaimable).toBe(0n);
+        expect(await vault.getObjectionDeadline()).toBe(BigInt(NOW + OBJECTION_WINDOW));
+        expect(await balanceOf(vault.address)).toBe(POOL);
+    });
+
+    it('FinalizeDelivery is blocked during the window and settles after it', async () => {
+        await fundBoth();
+        await submitReport(relayer, DELIVERED);
+
+        const early = await vault.send(stranger.getSender(), { value: toNano('0.1') }, 'FinalizeDelivery');
+        expect(early.transactions).toHaveTransaction({ from: stranger.address, to: vault.address, success: false });
+        expect((await vault.getVaultState()).state).toBe(2n);
+
+        blockchain.now = NOW + OBJECTION_WINDOW + 1;
+        await vault.send(stranger.getSender(), { value: toNano('0.1') }, 'FinalizeDelivery');
+
+        const st = await vault.getVaultState();
+        expect(st.state).toBe(3n);                 // SUCCESSFUL
+        expect(st.sellerClaimable).toBe(SELLER_PAYOUT);
+        expect(st.commissionairesClaimable).toBe(COMMISSION);
+        expect(st.buyerClaimable).toBe(0n);
+        // Finalize clears the now-stale report fields instead of leaving them set forever.
+        expect(await vault.getObjectionDeadline()).toBe(0n);
+        expect(await vault.getReportedStatus()).toBe(0n);
+
+        await withdraw(seller);
+        await withdraw(commissionaires);
+        expect(await balanceOf(seller.address)).toBe(USDT(100) - GUARANTEE + SELLER_PAYOUT);
+        expect(await balanceOf(commissionaires.address)).toBe(COMMISSION);
+        expect(await balanceOf(vault.address)).toBe(0n);
+    });
+
+    it('a buyer objection during the window pre-empts finalization', async () => {
+        await fundBoth();
+        await submitReport(relayer, DELIVERED);
+
+        await vault.send(buyer.getSender(), { value: toNano('0.1') }, { $$type: 'RaiseDispute' });
+        expect((await vault.getVaultState()).state).toBe(4n);   // DISPUTED
+
+        blockchain.now = NOW + OBJECTION_WINDOW + 1;
+        const res = await vault.send(stranger.getSender(), { value: toNano('0.1') }, 'FinalizeDelivery');
+        expect(res.transactions).toHaveTransaction({ from: stranger.address, to: vault.address, success: false });
+        expect((await vault.getVaultState()).state).toBe(4n);
+    });
+
+    it('a Failed report opens a window; after it, finalize slashes the bond to the buyer', async () => {
+        await fundBoth();
+        await submitReport(relayer, FAILED);
+
+        // Not instant — a 72h window opens (either party may still object).
+        let st = await vault.getVaultState();
+        expect(st.state).toBe(2n);                 // still AWAITING_CONFIRMATION
+        expect(await vault.getObjectionDeadline()).toBe(BigInt(NOW + OBJECTION_WINDOW));
+        expect(await vault.getReportedStatus()).toBe(BigInt(FAILED));
+
+        blockchain.now = NOW + OBJECTION_WINDOW + 1;
+        await vault.send(relayer.getSender(), { value: toNano('0.1') }, 'FinalizeDelivery');
+
+        st = await vault.getVaultState();
+        expect(st.state).toBe(6n);                 // CANCELLED
+        expect(st.buyerClaimable).toBe(POOL);      // trade value + slashed bond
+        expect(st.sellerClaimable).toBe(0n);
+        expect(await vault.getObjectionDeadline()).toBe(0n);
+        expect(await vault.getReportedStatus()).toBe(0n);
+
+        await withdraw(buyer);
+        expect(await balanceOf(buyer.address)).toBe(USDT(100) + GUARANTEE);   // recovered trade + bond
+        expect(await balanceOf(seller.address)).toBe(USDT(100) - GUARANTEE);  // lost the bond
+        expect(await balanceOf(vault.address)).toBe(0n);
+    });
+
+    it('the SELLER can object a Failed report within the window (→ dispute, no slash)', async () => {
+        await fundBoth();
+        await submitReport(relayer, FAILED);
+
+        // Seller contests the wrong Failed → DISPUTED, pre-empting the slash.
+        await vault.send(seller.getSender(), { value: toNano('0.1') }, { $$type: 'RaiseDispute' });
+        expect((await vault.getVaultState()).state).toBe(4n);   // DISPUTED
+
+        blockchain.now = NOW + OBJECTION_WINDOW + 1;
+        const res = await vault.send(relayer.getSender(), { value: toNano('0.1') }, 'FinalizeDelivery');
+        expect(res.transactions).toHaveTransaction({ from: relayer.address, to: vault.address, success: false });
+        expect((await vault.getVaultState()).state).toBe(4n);   // still disputed — DAO/mutual/timeout decides
+    });
+
+    it('oracle-only vault: manual doc-hash confirm is rejected', async () => {
+        await fundBoth();
+        const res = await vault.send(seller.getSender(), { value: toNano('0.1') }, {
+            $$type: 'SellerConfirmDelivery', docHash: 0x99n,
+        });
+        expect(res.transactions).toHaveTransaction({ from: seller.address, to: vault.address, success: false });
+        expect((await vault.getVaultState()).sellerConfirmed).toBe(false);
+    });
+
+    it('manual-only vault: oracle report rejected, doc-hash path settles', async () => {
+        const mv = await initVaultWithMode(2n, 1);   // settlementMode = manual
+        expect(await mv.getSettlementMode()).toBe(1n);
+        await fundBoth(mv.address);
+
+        // A validly-signed report is forwarded by the registry but the vault refuses it.
+        const res = await submitReport(relayer, DELIVERED, VTYPE, undefined, null, mv.address, 2n);
+        expect(res.transactions).toHaveTransaction({ from: registry.address, to: mv.address, success: false });
+        expect(await mv.getObjectionDeadline()).toBe(0n);
+
+        // Two-phase doc-hash confirm works and settles.
+        await mv.send(seller.getSender(), { value: toNano('0.1') }, { $$type: 'SellerConfirmDelivery', docHash: 0x42n });
+        await mv.send(buyer.getSender(), { value: toNano('0.1') }, { $$type: 'BuyerConfirmReceipt', docHash: 0x42n });
+        expect((await mv.getVaultState()).state).toBe(3n);   // SUCCESSFUL
+    });
+
+    it('DON-key rotation is time-locked (schedule → wait → apply)', async () => {
+        const newKp = keyPairFromSeed(Buffer.alloc(32, 3));
+        const newPub = bufToBigInt(newKp.publicKey);
+
+        await registry.send(dao.getSender(), { value: toNano('0.05') }, { $$type: 'ScheduleDonKey', newKey: newPub });
+        expect(await registry.getDonPublicKey()).toBe(bufToBigInt(donKey.publicKey));   // unchanged yet
+
+        const early = await registry.send(dao.getSender(), { value: toNano('0.05') }, { $$type: 'ApplyDonKey' });
+        expect(early.transactions).toHaveTransaction({ from: dao.address, to: registry.address, success: false });
+        expect(await registry.getDonPublicKey()).toBe(bufToBigInt(donKey.publicKey));
+
+        blockchain.now = NOW + 86400 + 1;   // past the 24h timelock
+        await registry.send(dao.getSender(), { value: toNano('0.05') }, { $$type: 'ApplyDonKey' });
+        expect(await registry.getDonPublicKey()).toBe(newPub);
+
+        // Old key now rejected; new key accepted.
+        await fundBoth();
+        const oldSig = signWith(donKey, vault.address, 1n, VTYPE, DELIVERED, null);
+        const rejected = await submitReport(relayer, DELIVERED, VTYPE, oldSig);
+        expect(rejected.transactions).toHaveTransaction({ from: relayer.address, to: registry.address, success: false });
+
+        await submitReport(relayer, DELIVERED, VTYPE, signWith(newKp, vault.address, 1n, VTYPE, DELIVERED, null));
+        expect(await vault.getObjectionDeadline()).toBe(BigInt(NOW + 86400 + 1 + OBJECTION_WINDOW));
+    });
+
+    it('a Partial report routes to the dispute machinery', async () => {
+        await fundBoth();
+        await submitReport(relayer, PARTIAL);
+        expect((await vault.getVaultState()).state).toBe(4n);   // DISPUTED
+        expect(await vault.getDisputeDeadline()).toBe(BigInt(NOW + 2592000));
+    });
+
+    it('the buyer can confirm receipt and release funds early, waiving the window', async () => {
+        await fundBoth();
+        await submitReport(relayer, DELIVERED);   // 48h window open…
+        // …but the happy buyer releases immediately.
+        await vault.send(buyer.getSender(), { value: toNano('0.1') }, { $$type: 'BuyerAcceptDelivery' });
+
+        const st = await vault.getVaultState();
+        expect(st.state).toBe(3n);                 // SUCCESSFUL now, no wait
+        expect(st.sellerClaimable).toBe(SELLER_PAYOUT);
+        expect(st.commissionairesClaimable).toBe(COMMISSION);
+
+        await withdraw(seller);
+        await withdraw(commissionaires);
+        expect(await balanceOf(seller.address)).toBe(USDT(100) - GUARANTEE + SELLER_PAYOUT);
+        expect(await balanceOf(commissionaires.address)).toBe(COMMISSION);
+    });
+
+    it('the buyer can release even before any oracle report', async () => {
+        await fundBoth();
+        await vault.send(buyer.getSender(), { value: toNano('0.1') }, { $$type: 'BuyerAcceptDelivery' });
+        expect((await vault.getVaultState()).state).toBe(3n);   // SUCCESSFUL
+    });
+
+    it('only the buyer can release funds (seller is rejected)', async () => {
+        await fundBoth();
+        const res = await vault.send(seller.getSender(), { value: toNano('0.1') }, { $$type: 'BuyerAcceptDelivery' });
+        expect(res.transactions).toHaveTransaction({ from: seller.address, to: vault.address, success: false });
+        expect((await vault.getVaultState()).state).toBe(2n);   // unchanged
+    });
+});
