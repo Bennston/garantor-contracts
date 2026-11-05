@@ -349,6 +349,20 @@ Withdraw/Cancel/doc-hash receivers are unchanged.
 2. `myJettonWallet` only ever set from a `TakeWalletAddress` sent by the stored
    `jettonMaster` (verify `sender() == jettonMaster`).
 3. Unrecognised / wrong-state / wrong-amount deposits are **refunded**, never trapped.
+   **Caveat (V2-N4, audit 2026-09-26):** this holds only if the deposit's TEP-74
+   transfer carries `forwardTonAmount > 0` in the first place — with `0`, no
+   `transfer_notification` is ever sent, so the vault never learns the deposit
+   happened at all. The jettons still land in its jetton wallet, but nothing
+   in this checklist item runs, and (per §6.3 above) the contracts deliberately
+   never sweep an uncredited balance — so this is unrecoverable from the
+   contract side. There is no on-chain fix: a `forwardTonAmount` of 0 is a
+   syntactically valid TEP-74 transfer the vault's wallet is required to
+   accept. The fix lives in the deposit UI/SDK instead — both
+   `buildJettonTransferPayload` builders (`jettonEscrowClient.js` and its
+   marketplace-vault duplicate in `marketplaceClient.js`) now hard-reject a
+   `forwardTonNano` below 0.01 TON, so a misconfigured
+   `VITE_JETTON_DEPOSIT_FORWARD_TON` / `VITE_MARKETPLACE_DEPOSIT_FORWARD_TON`
+   env var can't silently produce one of these transfers.
 4. Payout jetton transfers always target `myJettonWallet` with bounded TON.
 5. No payout can exceed the vault's actual jetton balance (conservation:
    Σ claimables == Σ deposits, enforced as in V1).

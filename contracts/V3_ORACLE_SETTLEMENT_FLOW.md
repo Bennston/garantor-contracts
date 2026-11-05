@@ -106,9 +106,8 @@ settle a vault expecting a different oracle kind.
 
 ### 4.2 The 48h objection window — optimistic settlement
 > **Enforced window = 48 hours.** `ObjectionWindow = 172800` seconds
-> (`escrow_oracle_vault.tact:231`). NOTE: one inline comment (line ~733) still
-> says "72h" — that comment is stale; the code pays out on 48h. Fix the comment
-> before mainnet so docs and code agree.
+> (`escrow_oracle_vault.tact:231`). The stale "72h" inline comment has been
+> fixed to match.
 
 A "delivered" or "failed" report does **not** pay out. It opens the window, records
 the pending status, and waits (`receive(msg: OracleReport)`). During the window
@@ -208,6 +207,11 @@ sellerClaimable = 0                                         // no commission on 
 
 ## 7. Pre-mainnet notes surfaced by this write-up
 
-- Fix the stale "72h" comment at `escrow_oracle_vault.tact:~733` → 48h.
+- ✅ Fixed the stale "72h" comment at `escrow_oracle_vault.tact:~732` → 48h.
+- ✅ `OracleRegistry.SubmitReport` now requires the submitter to attach at
+  least `ReportGas` and rejects a replay of an already-processed report hash
+  (`processedReports` map) — previously anyone could resubmit an old valid
+  signed report indefinitely, draining the registry's TON balance and
+  blocking oracle settlement for every vault trusting it.
 - Add `VITE_PINATA_JWT` + `VITE_IPFS_GATEWAY` to the mainnet frontend env (or
   launch the marketplace links-only, consciously).

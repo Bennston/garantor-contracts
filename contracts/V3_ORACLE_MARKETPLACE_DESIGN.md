@@ -17,7 +17,7 @@ buildable on TON, correcting three EVM-shaped assumptions in that brief (see §2
 | # | Decision | Choice |
 |---|----------|--------|
 | 1 | Rollout | **V3 alongside V1/V2.** New `MarketplaceListing` + `OracleRegistry` contracts; the V2 jetton vault is **extended** (new fields + one receiver), never forked or mutated. Frontend routes oracle-settled trades to V3; TON/jetton escrows stay on V1/V2. |
-| 2 | Auto-settle trust | **Objection window, not instant payout.** BOTH a "Delivered" and a "Failed" oracle report open a 72h window during which **either buyer or seller** may `RaiseDispute`; only after the window with no objection does anyone's `FinalizeDelivery` apply the reported outcome (Delivered→seller, Failed→slash bond to buyer). "Partial" goes straight to DISPUTED. Preserves "no unilateral fund movement". |
+| 2 | Auto-settle trust | **Objection window, not instant payout.** BOTH a "Delivered" and a "Failed" oracle report open a 48h window during which **either buyer or seller** may `RaiseDispute`; only after the window with no objection does anyone's `FinalizeDelivery` apply the reported outcome (Delivered→seller, Failed→slash bond to buyer). "Partial" goes straight to DISPUTED. Preserves "no unilateral fund movement". |
 | 2b | Settlement rail pin | **Each listing pins a `settlementMode`: `oracle-only` (0) or `manual-only` (1).** An oracle-only vault disables the two-phase doc-hash confirm; a manual-only vault rejects oracle reports. No vault accepts both rails — the guarantee matches what the listing advertised. |
 | 3 | Scope | **Asset-agnostic core.** `validationType` is an enum + opaque `proof` blob. Vertical-specific integrations (commodity NFT, IoT/GPS geofence, API heartbeat) are deferred behind that interface. |
 | 4 | Oracles | **Chainlink via the CRE hybrid pattern, not direct integration** (Chainlink has no on-chain TON deployment — no Data Feeds/Functions/CCIP/Forwarder on TON). A Chainlink CRE workflow fetches supply-chain/IoT/API data; the DON reaches consensus; our CRE bridge re-signs a canonical report with an **Ed25519 attestation key**; any relayer pushes `{report, signature}` to `OracleRegistry`, which **verifies the signature** (native `checkSignature`/CHKSIGNU) against the DAO-registered key. Trust anchor = the signature, not the sender. Price data (if ever needed) via **Pyth**/**RedStone** (both live on TON). |
@@ -135,7 +135,7 @@ Logic:
 2. `require(msg.validationType matches self.validationType)` — report kind must match
    what the listing declared (an "API check" oracle cannot settle a "GPS" vault).
 3. `status == Delivered` → set `objectionDeadline = now() + OBJECTION_WINDOW`
-   (default 72h). Does **not** pay out yet.
+   (default 48h). Does **not** pay out yet.
 4. `status == Failed` → route to the existing refund path (buyer refunded, as expiry/cancel).
 5. `status == Partial` → route to the existing `DISPUTED` flow (`ProposeSettlement` /
    DAO `ResolveDispute` / 30-day timeout all apply unchanged).
@@ -254,7 +254,7 @@ Fold into the existing `daoFee` allocation (already `<= 10%` invariant-guarded):
    purchases (spawns a vault), both parties deposit, the CRE bridge submits a
    DON-signed Delivered report, confirms the objection window opens, then either
    stops (printing resume instructions) or — if `WAIT_FOR_FINALIZE=1` — polls out
-   the real 72h window and finalizes + withdraws. Resumable via
+   the real 48h window and finalizes + withdraws. Resumable via
    `LISTING_ADDRESS`/`VAULT_ADDRESS`+`TRADE_ID` overrides.
 11. ☐ Time-lock wrap the factory admin ops; external audit; mainnet rollout.
 

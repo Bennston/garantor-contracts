@@ -49,7 +49,7 @@ ourselves**: `CreBridge` signs an Ed25519 report, `OracleRegistry` verifies it.
 The `Validator` interface *is* the Functions/CRE job.
 
 **Trust model today:** single DON key (option 1 of 3). A false verdict only
-*opens* the 72h objection window; it never drains a vault against an attentive
+*opens* the 48h objection window; it never drains a vault against an attentive
 buyer. Decentralizing later (M-of-N committee, or real Chainlink CRE via a bridge)
 requires **no contract change** — the vault only checks "is this signature from a
 key the registry trusts?"
@@ -71,7 +71,7 @@ CRE relayer (runCreBridge, one trade / run):             ▼
         ▼
   proof = "SHIP|delivered|<tracking>|<code>|cid:<blCid>"   ← B/L bound into the verdict
         ▼
-  CreBridge signs (Ed25519) ─▶ OracleRegistry verifies ─▶ vault opens 72h window
+  CreBridge signs (Ed25519) ─▶ OracleRegistry verifies ─▶ vault opens 48h window
         ▼
   window elapses, no buyer objection ─▶ FinalizeDelivery ─▶ seller paid
 ```
@@ -154,14 +154,14 @@ npx blueprint run runCreBridge
 ```
 `REPORT_STATUS` selects the `StaticValidator` (no data source); `CARRIER=mock
 CARRIER_MOCK_STATE=delivered` is equivalent. This produces a real DON-signed report
-and opens the 72h objection window exactly like the automated path. The `Validator`
+and opens the 48h objection window exactly like the automated path. The `Validator`
 layer is pluggable by design — the data source may be a carrier API, an IoT feed,
 **or a human**.
 
 **3. Dispute / DAO.** `RaiseDispute` → DAO resolve / mutual settle / timeout.
 
 > Trust note: a manual verdict is NOT less safe — it still only *opens* the objection
-> window, never moves funds. The buyer can veto with `RaiseDispute` in the 72h. Adding
+> window, never moves funds. The buyer can veto with `RaiseDispute` in the 48h. Adding
 > a subscription later flips one env var (`REPORT_STATUS=0` → `CARRIER=vizion`);
 > nothing else changes.
 
@@ -199,3 +199,69 @@ layer is pluggable by design — the data source may be a carrier API, an IoT fe
    handles that (it just keeps polling). ShipsGo remains a config-only alternative.
 4. **Decentralize the DON key (optional, later).** Move from single-key to M-of-N
    committee or Chainlink CRE. No contract change required.
+
+---
+
+## 7. AI delivery cross-check (backend relayer) — BUILT 2026-10, inert by default
+
+Closes the "delivery is not the same as the documents matching the sale" gap for the
+backend relayer ([jobs/oracle-relayer.js](../garantor-backend/src/jobs/oracle-relayer.js)).
+Once the **carrier** reports `delivered`, Claude cross-checks the seller's bill of
+lading (fetched from IPFS by CID) against the listing terms and the carrier milestones
+before the DON report is signed.
+
+**Downgrade-only.** The final status comes from a deterministic gate
+([lib/oracle-verdict.js](../garantor-backend/src/lib/oracle-verdict.js) `decide()`), not
+from the model:
+
+| Carrier says | AI verdict | Relayer does |
+|---|---|---|
+| not delivered | (AI not called) | wait |
+| delivered | consistent (confidence medium/high) | submit **Delivered** |
+| delivered | inconsistent, or injection suspected | submit **Partial** → vault goes straight to DISPUTED (council) |
+| delivered | inconclusive / low confidence | wait; after `ORACLE_AI_MAX_WAIT_HOURS` (24) → **Partial** |
+| delivered | AI unavailable / error | wait (never escalates, never pays) |
+
+The AI never issues **Failed** (which would auto-slash the seller bond after the
+objection window) and can never create a payout the carrier did not already signal, so
+a fully manipulated model can at worst reproduce the carrier-only behaviour. The vault
+and registry are unchanged — Partial already exists on-chain.
+
+**Provenance.** The signed proof cell is `AIV1|<D|P>|<sha256 of the evidence>|cid:<B/L CID>`.
+The registry hashes it into the DON signature, so a published report commits to the exact
+evidence snapshot stored in `oracle_verdicts` (migration 027, append-only: evidence with the
+B/L's sha256, model, validated verdict, decision, reason).
+
+**Document fetching** ([lib/evidence-docs.js](../garantor-backend/src/lib/evidence-docs.js)):
+CID only (the URL is built from `IPFS_GATEWAY`, never from party input), https only,
+redirects not followed, 10 MB cap enforced while streaming, timeout, file type decided by
+magic bytes (PDF/PNG/JPEG). Listing document URLs written by parties are NOT fetched.
+
+**Rollout.** `ORACLE_AI_MODE=off` (default) -> `shadow` (evaluate + record, submit exactly
+as before; review the recorded verdicts) -> `enforce`. Dry-run one vault without sending
+anything: `node scripts/run-oracle-verdict.js --vault <addr> [--vizion]`.
+Tests: `node scripts/test-oracle-verdict.js` (offline, 50 checks; `--live` runs the real
+model on generated B/L PDFs including prompt-injection attempts — run it once before
+`enforce`).
+
+**Caveats.** It checks that the *documents are consistent with the sale*; it cannot see
+the goods, so physical quality remains a buyer-dispute matter (the objection window still
+applies). A seller can forge a B/L, but a forged document only matters if the carrier
+also reports delivery; the AI can only make the outcome stricter. The seller's B/L is sent
+to the Anthropic API (privacy disclosure needed).
+
+**Scheduling.** The relayer endpoint `/api/cron/oracle-relayer` is called by the backend repo's
+GitHub Actions workflow `.github/workflows/oracle-relayer.yml` (every 30 min, secrets `BACKEND_URL`
++ `CRON_SECRET`; Vercel Hobby's two cron slots are used). While the oracle rail is dormant it only
+finalizes expired windows. Each run has a wall-clock budget (`ORACLE_RELAYER_BUDGET_MS`, 50s) and the
+AI call a shorter timeout (`ORACLE_AI_TIMEOUT_MS`, 45s) because it runs inside a Vercel function.
+Do not enable `shipping-relayer.yml` (the older TS path) alongside it. Deploy steps:
+`garantor-backend/AI_FEATURES_DEPLOY.md`.
+
+**Objection window.** The default is **48h** (`172800`), not 72h as older notes say. It is a DAO
+parameter on the marketplace factory (`UpdateListingParams`, op 0x6108, `objectionWindow`, valid
+5 min..1 year) that is snapshotted into each NEW listing, so a change never touches existing listings
+and needs no redeploy. To move future listings to 72h (a Friday report then closes on Monday, not
+Sunday) propose it from the DAO multisig with `scripts/proposeMarketplaceParams.ts`
+(`EXPECTED_NETWORK=mainnet DRY_RUN=1 npx blueprint run proposeMarketplaceParams --mainnet` to preview).
+72h is still short for commodity lab inspection; revisit with real trade data.
