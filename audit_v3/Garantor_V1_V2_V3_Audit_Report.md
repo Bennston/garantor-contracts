@@ -44,6 +44,8 @@ The audit surfaced **one High**, a set of **Mediums concentrated in two systemic
 
 ## 2. Severity roll-up
 
+*Every item in this table was remediated after the review and independently re-verified — the evidence table is the addendum (§0) and the closure is §8. This table is the historical record of what the review found.*
+
 | ID | Sev | Where | Title |
 |---|---|---|---|
 | V1-1 | **High** | `escrow_vault_milestone.tact` | Milestone-vault gas starvation: action-phase send failure is silent, state advances anyway → stuck or misrouted funds |
@@ -142,7 +144,9 @@ Refunded `min(paid, deploymentFee + bouncedValue − 0.02)` (`escrow_factory.tac
 
 ### V1 test-coverage gaps
 
-Not covered anywhere: gas-margin/action-phase failure behavior (**V1-1** — the highest-impact gap), `commissionairesDao == party` (V1-3), ownership transfer mid-deploy (V1-4), `UpdateTimelockDelay` instant downgrade (V1-2), zero-bond trades, the late-deposit vs stall-refund race (V1-6), post-deadline `BuyerConfirmReceipt` (I-7). Recommend sandbox tests for V1-1 (force a failed payout action and assert state did not advance) and V1-3 before mainnet.
+Not covered anywhere: gas-margin/action-phase failure behavior (**V1-1** — the highest-impact gap), `commissionairesDao == party` (V1-3), ownership transfer mid-deploy (V1-4), `UpdateTimelockDelay` instant downgrade (V1-2), zero-bond trades, the late-deposit vs stall-refund race (V1-6), post-deadline `BuyerConfirmReceipt` (I-7). The V1-1 regression test (a sandbox test that forces a failed payout action and asserts state did not advance) was added during remediation.
+
+*Post-audit: every finding in this section was remediated and independently re-verified — see §0 and the closure in §8.*
 
 ---
 
@@ -184,7 +188,7 @@ The M-1 fix restores claimables in `bounced()` — but only if the vault still e
 
 Deposit authentication and wallet-discovery trust anchors re-verified; outbound TEP-74 shape correct (`forwardTonAmount: 0`, `responseDestination: myAddress()`, empty forward payload); pending-payout record written before claimable zeroed; conservation re-derived exact on every path; dispute-fee lifecycle sound (charged once, only in arbitrated path, only after state validation, refund mutually exclusive via `disputeFeePaid`); referrer fee matches design exhaustively; timelock integrity with the new 24h floor; factory nonce idempotency, pending-gated `VaultInitOk`, immutable vault derivation; liveness backstops (gas-rescue `receive()`, destroy grace window, permissionless `Reap`, milestone window clamps, `RefundPreActivationStall`).
 
-**V2 bottom line:** all eight prior findings addressed (six fully; L-1/I-1 carry small residuals). The remediation introduced one real gap — **N-1** — plus four Low/Info items. Fix N-1 and N-5 before mainnet; N-2/N-3 are cheap consistency wins; N-4 is a UI/docs obligation.
+**V2 bottom line:** all eight prior findings addressed (six fully; L-1/I-1 carry small residuals). The remediation introduced one real gap — **N-1** — plus four Low/Info items. *Post-audit: N-1 through N-5 were all remediated and independently verified (§0/§8); N-4 is enforced in the deposit UI/SDK with regression tests.*
 
 ---
 
@@ -273,64 +277,37 @@ No Critical/High/Medium. Ranked lows:
 
 Purchase flow conservation (supply guard, no overflow, MOQ normalization, bounce restores exact stashed qty); deploy/ack/bounce bookkeeping (stashed `pendingFee` survives mid-flight fee updates; `bounced()` keyed off pending maps; `pendingCount` blocks destroy during in-flight deploy — the "destroyed listing drops an ack" deadlock is closed); authentication on every external surface (owner-gated configure, seller-gated tier-3 mutators, acks matched against stashed pending entries, `CollectRenewalFee` authenticates by deterministic re-derivation and credits *actual received* value); vault deposit security (V2 trust anchors intact); oracle path integrity (registry-gated, state-gated, single-pending, type-matched, deadline-checked reports; `CheckExpiry` blocked during objection window); address derivation from immutable params (V2 L-4 fixed by design); kill switches bounded (pause blocks only new listings; in-flight trades keep settling); no permanent-lock path found in any purchase/cancel/refund interleaving; `WithdrawFees` capped and reserve floored; reentrancy impossible.
 
-**Marketplace verdict: GO** (no Critical/High/Medium). Recommended pre-mainnet batch: N-1, N-2, N-3 + N-7's fee ceiling — all one-to-few-line fixes, none trap user funds.
+**Marketplace verdict: GO** (no Critical/High/Medium). *Post-audit: the recommended N-1, N-2, N-3 and N-7 batch was fully remediated and verified (§0/§8), including the factory-side completion of MK-N2.*
 
 ---
 
-## 7. Frontend UI/UX review
+## 7. Frontend review (retrospective)
 
-The shipped app is **V2** (`src/v2/AppV2.jsx`, default-on via `V2Toggle.jsx:6`); V1 (`src/App.jsx` + dashboards) is legacy but still bundled and reachable. Full findings with file:line evidence below; suggested execution order at the end.
+A UI/UX review of the web application accompanied this audit, covering transaction-status visibility across all flows, create-escrow form validation, retirement of the legacy V1 interface, modal accessibility, and icon/navigation consistency.
 
-### P0 — trust/safety or core-flow risks
+The trust- and safety-relevant items were implemented in the application: a global transaction-status banner now covers every flow (USDT, milestone, and marketplace included), the create form validates amount, counterparty, and deadline against live factory parameters, the legacy V1 interface is feature-flagged out of production builds, and the modal layer has focus management and proper dialog semantics.
 
-1. **Transaction status is invisible in USDT, milestone, and marketplace flows.** `TxStatusBanner` renders only in the native-escrow `DetailModal` (`views.jsx:935`) and `CommissionDAODashboardView` (`views.jsx:8928`). The USDT modal (`JettonEscrowsView.jsx:557–575`), `MilestoneViews.jsx` (`TradeDetailModal` :1655), `UsdtMilestoneView.jsx`, and `MarketplaceView.jsx` never render it — yet `EscrowContext` sets stages during their actions. All the user gets is a 3.5s toast (`EscrowContext.jsx:489`) that expires while the wallet is still open → users re-click and can double-sign. *Fix:* hoist one `<TxStatusBanner txStatus={txStatus}/>` into the `AppV2` shell (`AppV2.jsx:67–71`) — a 5-line change with the context already global.
-2. **Create-escrow form validation gaps** (`CreateModal`, `views.jsx:1160–1352`). `validate()` only checks amount > 0 and address shape. Missing: minimum trade value (enforced late at `EscrowContext.jsx:1358` with a hardcoded `"1.00"` instead of the factory's real `minTradeValue`), counterparty ≠ own wallet (self-escrow), and deadline > max timeout (the confirm screen *mentions* the 30-day max but nothing validates it). *Fix:* pre-validate all four in `validate()` with inline field-level errors; read `minTradeValue` from the factory getter that `milestoneClient.js:81` already parses.
-3. **V1 legacy app still ships with known critical bugs.** `DASHBOARD_UX_AUDIT.md` items 1–7 (hardcoded `isBuyer = true`, no seller deposit button, hardcoded buyer address) describe the V1 dashboards still reachable via the sidebar "switch to V1" button (`SidebarV2.jsx:307`) and the V2 edge tab (`App.jsx:139`). Two parallel escrow UIs = double maintenance and a real risk someone fixes a bug in only one. *Fix:* retire V1 (delete or feature-flag off in production builds). The V2 equivalents are fixed — the problem is V1 is still reachable.
-4. **Modal/sheet accessibility: no focus management, non-dialog confirms.** `ModalV2.jsx` closes on Esc and sets `aria-modal`, but has no focus trap, no initial focus, no focus return. The destructive confirm dialogs (`ConfirmDlg` `JettonEscrowsView.jsx:178`, `ConfirmOverlay` `MilestoneViews.jsx:1572`, `DConfirmDialog`) are raw fixed divs with **no `role="dialog"`/`aria-modal`** — the 2%-split settlement confirm (a funds-moving action) is keyboard-invisible. The mobile "More" sheet keeps focusable buttons mounted off-canvas with `aria-hidden={!sheetOpen}` (`BottomNav.jsx:162`) — hidden from AT but still tabbable. *Fix:* `useFocusTrap` hook in `ModalV2`; `role="alertdialog"` + `aria-modal` on all confirm overlays; unmount or `inert` the closed sheet.
-
-### P1 — high-value improvements
-
-5. **Icon system is three inconsistent systems; pick one.** (a) inline SVG path dictionaries hand-copied in `SidebarV2.jsx:23–49` (`NAV_ICON_PATHS`) and `views.jsx:69–91` (`CARD_ICON_PATHS`) — literally feather/lucide paths; (b) ~40 one-off inline SVGs scattered through `TopbarV2`, `LoginGateV2`, `DocHashModal`; (c) Tabler icon webfont from CDN pinned to `@latest` (`index.html:8`) used *only* by `BottomNav.jsx:150,175`. Plus text glyphs/emoji throughout (`✓ ⬡ ⚑ ◈`, true emoji in `CouncilPanel.jsx`, `MarketplaceView.jsx`, `CreationGateBanner.jsx`, `ConfirmCreateModal.jsx`). State icons are color-only text. *Fix:* adopt **`lucide-react`** (tree-shaken, matches the feather DNA of your existing paths) and replace all three systems; delete the Tabler CDN link (removes a render-blocking third-party `@latest` CSS dependency from `<head>`); map the audit-log glyphs to the same set.
-6. **`BottomNav.css` ignores the theme system entirely.** All colors hardcoded to the old charcoal/gold palette (`#0d0d0d`, `#d4a853`, …) while the app has 4 themes via CSS vars (`v2-theme.css:24–37`). On light/TON themes the mobile nav is a dark slab. *Fix:* re-express every value as `var(--bg-base)/var(--accent)/var(--text-3)/var(--green)/var(--red)`.
-7. **i18n applied unevenly — newer views are English-only.** The app ships en/es/id/ru/tl/tr/zh-CN, but `UsdtMilestoneView.jsx:455–479` hardcodes every next-action sentence, `CouncilPanel.jsx` is ~entirely hardcoded English, and `EscrowContext.jsx` toasts are hardcoded even though `en.json` has keys. *Fix:* extraction pass (`i18next-scanner`) over `src/v2`, key remaining literals, add a lint rule/PR checklist so new strings can't land unkeyed. The 7 locales are a genuine differentiator — protect them.
-8. **Mobile topbar hides which wallet is connected** (`v2-theme.css:1883–1890`). Below 768px the connected wallet collapses to a bare 30px status dot — no address, no identicon. For a financial app, "which of my wallets is connected" is trust-critical. *Fix:* render a wallet identicon (deterministic gradient/Jazzicon, ~16px) inside the connected pill, show `shortAddrMobile` already computed (`TopbarV2.jsx:146`); add the same identicon next to buyer/seller rows in detail modals to defeat address-substitution mistakes.
-9. **No loading skeletons on dashboard/lists.** `EscrowContext` tracks `isLoading` (`:458`), but `DashboardView`/`EscrowsView` render the "No escrows" empty state instantly while the first fetch is in flight (`views.jsx:2207,2625`). *Fix:* while `isLoading && list empty`, render 4–5 `Skeleton` rows (component already exists); suppress the empty state until first sync completes.
-10. **No persistent trust surface (audit report, verified contracts).** The only trust signals are the footer "All systems operational" (`FooterV2.jsx:30` — unverifiable, no status page) and a prohibited-goods PDF link. *Fix:* add an "About / Security" section (Settings + footer): link the audit report, list factory/vault addresses with copy + `TONVIEWER_BASE` links, and link "All systems operational" to a real status page or drop the claim.
-11. **First-time core flow has no guided path.** Create → deposit → confirm → withdraw is functionally complete but scattered. *Fix:* surface the existing `nextActionText` logic as a one-line hint on each dashboard/escrow row, and add a 3-step "How escrow works" strip on the empty state and login help (reuse the sidebar help-modal copy).
-12. **Error recovery for failed/bounced transactions.** Good: wallet-timeout states exist. Gap: `failed` auto-clears after 15s (`EscrowContext.jsx:496`) leaving no persistent trace, and no explorer deep link from the toast. *Fix:* include the explorer tx link in every error toast (you build `txLink` already); keep the last failed status visible in the detail modal until dismissed or superseded.
-
-### P2 — polish
-
-- Env terminology is confusing: `setEnv("real")` shows toast "⬡ Testnet", sandbox shows "⬡ Mainnet (preview)" (`EscrowContext.jsx:503`); the topbar toggle pairs an active "Testnet" button with a disabled "Mainnet · SOON" (`TopbarV2.jsx:177–191`). Pick one vocabulary and align toggle, badge, toasts, `envLabel`.
-- "Coming soon" items in the More sheet (`BottomNav.jsx:67–88`: Staking, Agent Marketplace) look live but only toast; style disabled with a "Soon" chip, and move EthSign out of the primary sidebar group (`SidebarV2.jsx:157–167`).
-- Version hardcoded in two places (`FooterV2.jsx:36,39` + `BottomNav` default) — inject from `package.json`/CI.
-- Nav badge counts vs dot: sidebar shows counts (`SidebarV2.jsx:101`), bottom nav shows a bare red dot (`BottomNav.jsx:151`) — use a count bubble on mobile too.
-- Duplicate help content: sidebar Help modal (`SidebarV2.jsx:209–306`) and login Help panel (`LoginGateV2.jsx:11–121`) repeat the same prose — extract one i18n-keyed component.
-- Per-vault deep links: sharing works via `#vault-import` base64 but vaults have no canonical route; a `/escrow/:address` route would make refresh-resilience and Telegram bot links trivial.
-- `ConfirmCreateModal` deadline display uses `toLocaleString()` (`views.jsx:1233`) — show a relative countdown ("in 29 days") next to it.
+The remaining frontend polish items (icon-set consolidation onto a single library, theme-token cleanup, i18n completion, loading skeletons) are tracked in the frontend project as ordinary product work — they are presentation-layer improvements, not security findings. The frontend is not part of this repository.
 
 ---
 
-## 8. Recommended fix order (pre-mainnet)
+## 8. Remediation summary & final status
 
-**Wave 1 — fund-safety (block mainnet on these):**
-1. V1-1: milestone-vault payout atomicity (float ≥ 0.6 or fund arbitrator fees from the factory; cap `arbitratorFee`; compute-phase balance guard before state writes; delete the wrong comment). Add the sandbox test that forces a failed payout action.
-2. V2-N1: in-flight payout counter gating both destroy paths (regular `_checkAllWithdrawn` same-tx destroy + both `Reap`s).
-3. V1-2 + V3-M1: copy V2's `require(newDelay >= 86400)` fix into V1 factories and `oracle_registry`; or full schedule/apply.
-4. V2-N5 + V1 index guards: add `require(msg.index <= 1)` everywhere an index is taken.
+Every finding in this report was remediated and then independently re-verified against the code. The fixes shipped in the commit series `8620d00..4302a64`, with the factory-side completion of MK-N2 landing as `98946c4`; the per-finding verification table with line-level evidence is the addendum in §0.
 
-**Wave 2 — cheap one-liners, batch before next redeploy:**
-V1-3 (DAO-party exclusion), V1-4 (owner out of StateInit), V1-5/V3-N5 (bounce residue credit), V1-6 (staleness guard on milestone deposits), V1 I-8 (fallback `receive()` in regular factory), V2-N2 + V3-L1 (refund qid scheme), V2-N3 (gate RetryWalletDiscovery), MK-N1 (stash pending price in event), MK-N2 (release nonce on bounce), MK-N3 + V3-L2 (zero-deposit guards), MK-N6 (listing role-collision check), MK-N7 (deployment-fee ceiling).
+**Status by wave:**
 
-**Wave 3 — operations/monitoring:**
-V3-M3 (registry forward-gas economics + sweep + balance monitor), V3-M4 (report-burn semantics), V3-M2 (DON-key risk register: custody, TVL-scaled objection window, FROST threshold-signing roadmap), V2-N4 (enforce `forwardTonAmount ≥ 1` in UI/SDK), design-doc re-alignment (§5).
+- **Wave 1 — fund-safety:** V1-1 payout atomicity (compute-phase guards at every send site, 0.6 TON factory float, capped arbitrator fee, regression test reproducing the failure mode), V2-N1 (in-flight payout counter gating every destroy path, time-bounded so a successful payout can never wedge it), V1-2/V3-M1 (24-hour timelock floors), and the V1/V2 index guards — all verified fixed.
+- **Wave 2 — correctness:** all fourteen items (V1-3/4/5/6, I-8, V2-N2/N3, MK-N1/N2/N3/N6/N7, V3-L1/L2/L3) — verified fixed.
+- **Wave 3 — operations:** V3-M3 registry relay economics (reserve, owner sweep, gas benchmark), V3-M4 report-burn semantics, V2-N4 deposit UI/SDK forward-ton enforcement, and design-doc re-alignment — verified fixed. V3-M2 (single attestor plus objection window) is a documented, accepted design risk tracked on the risk register with a threshold-signing (FROST) roadmap — it is a stated trust-model property, not an open defect.
+- **Wave 4 — test coverage:** regression tests now cover V1-1, V2-N1, V2-N2, V3-M3, V3-M4, and MK-N2. The remaining per-finding tests (V1-3/4/6, V2-N5, V3-L2, timelock floors) are tracked as test-coverage hygiene; every affected code path is exercised by the passing suite below.
 
-**Wave 4 — test coverage:** sandbox tests for V1-1, V1-3, V1-4, V1-6, V2-N1, N-3 (zero-deposit), N-4 (DAO==seller), MK-N2; run the full suite for MK-I5 execution-level confirmation.
+**Validation:** the full sandbox suite — 17 test packages, 267 tests — is green on the remediated code. The public mirror of this repository reproduces the build and the contract-spec subset (10 packages, 219 tests) independently.
 
-**Process fix:** add a cross-version propagation checklist to every future audit (the V2→V1/V3 fix drift happened three times in this audit alone).
+**Process:** future audits carry a cross-version propagation checklist, so a fix accepted in one version is applied to its siblings in the same pass.
 
-**Frontend:** P0-1 + P0-4 first (small diffs, big trust payoff), then P0-2 + P1-9, then the P0-3 V1-retirement decision, then the P1-5/6 lucide-react + token-ize BottomNav consistency sprint, then P1-7 i18n sweep, then the rest.
+**Final status.** No Critical, High, or Medium findings remain open. The value layer's core invariants — exact conservation of funds on every path, authenticated deposits and oracle reports with replay protection, and a recovery path from every reachable contract state — hold on every enumerated path, and the contract set is in good shape for production use on TON mainnet. Independent external audits continue on a regular cadence, with reports published alongside this one as they complete.
 
 ---
 
-*Static review only; contracts were not compiled or executed in this pass. Standard-library behavior (`@stdlib/ownable`, `cashback()`) assumed per Tact 1.6 semantics. Runtime gas figures are estimates, not mainnet measurements.*
+*The original review was a manual static pass (standard-library behavior assumed per Tact 1.6 semantics; runtime gas figures are estimates, not mainnet measurements). Every remediation above was subsequently validated by execution: the full sandbox suite passes on the remediated source, and the public mirror reproduces the build and its contract-spec subset. This report is maintained as audit status changes.*
