@@ -205,6 +205,21 @@ contract EscrowJettonVaultMilestone with Deployable {
     pendingPayoutAmount: map<Int, Int as coins>;  // qid → amount
     failedPayout:        map<Address, Int as coins>; // recipient → accumulated bounced amount
 
+    // V2-N1 fix: _sweepAndDestroy must not destroy the vault while either is
+    // non-zero (relative to lastPayoutAt for inFlightPayouts — see
+    // _sweepAndDestroy). inFlightPayouts covers a send that hasn't resolved
+    // yet; failedPayoutCount covers a recipient whose ClaimFailedPayout retry
+    // would otherwise have no contract left to run against. inFlightPayouts is
+    // decremented by bounced() (TVM-authenticated) — not trusted from
+    // JettonExcesses, which per TEP-74 is sent by the RECIPIENT's own jetton
+    // wallet, an address this contract can't cheaply verify; treating it as
+    // confirmation would let a forger guessing the next sequential queryId
+    // suppress a genuine later bounce-restore.
+    inFlightPayouts:    Int as uint16;
+    failedPayoutCount:  Int as uint16;
+    // Timestamp of the most recent tracked send — see _sweepAndDestroy.
+    lastPayoutAt:       Int as uint32;
+
     m0CancelBuyer:      Bool;
     m0CancelSeller:     Bool;
     m1CancelBuyer:      Bool;
@@ -262,6 +277,9 @@ contract EscrowJettonVaultMilestone with Deployable {
         self.createdAt          = now();
         self.closedAt           = 0;
         self.withdrawNonce      = 0;
+        self.inFlightPayouts    = 0;
+        self.failedPayoutCount  = 0;
+        self.lastPayoutAt       = 0;
         self.m0CancelBuyer      = false;
         self.m0CancelSeller     = false;
         self.m1CancelBuyer      = false;
@@ -340,6 +358,9 @@ contract EscrowJettonVaultMilestone with Deployable {
     // L-1: permissionless retry if the initial discovery message was lost.
     receive("RetryWalletDiscovery") {
         require(!self.jwResolved, "Wallet already resolved");
+        // V2-N3: caller pays for their own retry instead of draining the vault's
+        // fixed WalletDiscoveryGas budget for free.
+        require(context().value >= self.WalletDiscoveryGas, "Send at least WalletDiscoveryGas");
         self._requestJettonWallet();
     }
 
@@ -569,6 +590,7 @@ contract EscrowJettonVaultMilestone with Deployable {
     receive(msg: ArbitratorResolveMilestone) {
         require(sender() == self.arbitrator, "Only arbitrator");
         require(self.vaultState == 1,        "Vault not active");
+        require(msg.index <= 1,              "Invalid milestone index"); // V2-N5
         // I-1: validate the milestone state BEFORE charging the fee, so a bad
         // index cannot consume the fee without actually resolving anything.
         if (msg.index == 0) {
@@ -720,6 +742,8 @@ contract EscrowJettonVaultMilestone with Deployable {
         let qid: Int = self.withdrawNonce;
         self.pendingPayoutAddr.set(qid, to);
         self.pendingPayoutAmount.set(qid, amount);
+        self.inFlightPayouts = self.inFlightPayouts + 1; // V2-N1: cleared by bounced(), time-bounded by lastPayoutAt
+        self.lastPayoutAt = now();
         send(SendParameters{
             to:     self.myJettonWallet,
             value:  self.JettonFwdGas,
@@ -746,17 +770,28 @@ contract EscrowJettonVaultMilestone with Deployable {
         let amt: Int     = self.pendingPayoutAmount.get(qid)!!;
         self.pendingPayoutAddr.del(qid);
         self.pendingPayoutAmount.del(qid);
+        self.inFlightPayouts = self.inFlightPayouts - 1; // V2-N1
         let prior: Int = 0;
-        if (self.failedPayout.exists(to)) { prior = self.failedPayout.get(to)!!; }
+        let isNewEntry: Bool = !self.failedPayout.exists(to);
+        if (!isNewEntry) { prior = self.failedPayout.get(to)!!; }
         self.failedPayout.set(to, prior + amt);
+        if (isNewEntry) { self.failedPayoutCount = self.failedPayoutCount + 1; } // V2-N1
     }
 
-    // Clean up the pending-payout entry once the jetton wallet confirms delivery.
-    // Only accepted from our own jetton wallet to prevent spoofing.
+    // Best-effort cleanup only — NOT relied on for correctness. Per TEP-74,
+    // `excesses` is sent by the RECIPIENT's own jetton wallet, not
+    // self.myJettonWallet, so the check below means this in practice only
+    // matches the narrow case where that happens to coincide. Real resolution
+    // is time-based (lastPayoutAt, see _sweepAndDestroy) plus bounced().
     receive(msg: JettonExcesses) {
         if (sender() != self.myJettonWallet) { return; }
+        if (!self.pendingPayoutAddr.exists(msg.queryId)) { return; }
         self.pendingPayoutAddr.del(msg.queryId);
         self.pendingPayoutAmount.del(msg.queryId);
+        self.inFlightPayouts = self.inFlightPayouts - 1; // V2-N1
+        // A confirmed payout may be the one _sweepAndDestroy was waiting on —
+        // give the close another chance now instead of relying only on Reap.
+        if (self.vaultState == 2) { self._sweepAndDestroy(); }
     }
 
     // Permissionless retry for a recipient whose payout previously bounced.
@@ -765,6 +800,7 @@ contract EscrowJettonVaultMilestone with Deployable {
         require(self.failedPayout.exists(s) && self.failedPayout.get(s)!! > 0, "No failed payout to claim");
         let amt: Int = self.failedPayout.get(s)!!;
         self.failedPayout.del(s);
+        self.failedPayoutCount = self.failedPayoutCount - 1; // V2-N1
         self._sendJettons(s, amt);
     }
 
@@ -789,6 +825,16 @@ contract EscrowJettonVaultMilestone with Deployable {
     // Nothing is withheld by waiting; only the leftover gas sweep is delayed.
     // `Reap` completes it afterwards.
     fun _sweepAndDestroy() {
+        // V2-N1: never destroy in the same transaction that just queued a
+        // payout send. Bounded by lastPayoutAt, not held open indefinitely — a
+        // real failure bounces back promptly, so once DestroyGraceWindow has
+        // passed since the last send with no bounce, it's safe to treat it as
+        // settled (see the JettonExcesses receiver above).
+        if (self.inFlightPayouts > 0 && now() < self.lastPayoutAt + self.DestroyGraceWindow) { return; }
+        // Unlike inFlightPayouts, failedPayoutCount stays an indefinite gate —
+        // a bounce already confirmed via bounced() that this money is owed;
+        // only ClaimFailedPayout should ever release it.
+        if (self.failedPayoutCount > 0) { return; }
         if (self.closedAt != 0 && now() < self.closedAt + self.DestroyGraceWindow) {
             return; // still inside the grace window — a late deposit can arrive
         }

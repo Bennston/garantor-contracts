@@ -31,6 +31,10 @@ message(0x7362d09c) JettonTransferNotification {
     forwardPayload: Slice as remaining;
 }
 
+message(0xd53276db) JettonExcesses {
+    queryId: Int as uint64;
+}
+
 message(0x2c76b973) ProvideWalletAddress {
     queryId: Int as uint64;
     ownerAddress: Address;
@@ -190,6 +194,19 @@ contract MockJettonWallet {
                     sender:         msg.from,
                     forwardPayload: msg.forwardPayload
                 }.toCell()
+            });
+        } else {
+            // TEP-74: with no forward requested, return the leftover TON attached
+            // to this internal_transfer to response_address as `excesses` — this
+            // is what lets the ORIGINAL sender's wallet (our escrow vaults) confirm
+            // a transfer actually landed and release their own pending-payout
+            // bookkeeping for it (see each vault's JettonExcesses receiver).
+            send(SendParameters{
+                to:     msg.responseAddress,
+                value:  0,
+                mode:   SendRemainingValue,
+                bounce: false,
+                body:   JettonExcesses{ queryId: msg.queryId }.toCell()
             });
         }
     }

@@ -259,8 +259,44 @@ contract EscrowJettonVault with Ownable {
     // Pending jetton payout tracking (M-1 fix): each Withdraw gets a unique
     // queryId; the pending maps let bounced() restore claimable if the send fails.
     withdrawNonce: Int as uint64;
-    pendingPayoutType:   map<Int, Int as uint8>;    // qid → 1=buyer 2=seller 3=comm
+    pendingPayoutType:   map<Int, Int as uint8>;    // qid → 1=buyer 2=seller 3=comm 4=refund
     pendingPayoutAmount: map<Int, Int as coins>;    // qid → amount
+
+    // V2-N2 fix: deposit refunds (over-deposit excess, wrong-phase, non-party)
+    // previously all shared queryId=0 with no pending-map entry at all, so a
+    // bounce (recipient frozen/destroyed between deposit and refund) returned to
+    // our own wallet with no claimable, no record, no recovery — and any second
+    // refund landing at the same qid before the first resolved would silently
+    // clobber it. Mirrors the milestone vault's failedPayout scheme: unique qid,
+    // accumulate on bounce, reclaim permissionlessly. Only used when
+    // pendingPayoutType[qid] == 4 — the buyer/seller/comm claimable-restore path
+    // above is untouched.
+    pendingRefundTo: map<Int, Address>;
+    failedPayout:    map<Address, Int as coins>;
+    // Counts distinct addresses currently holding a nonzero failedPayout balance.
+    // _checkAllWithdrawn must not destroy the vault while this is non-zero either
+    // — money already moved into failedPayout is just as unreachable as an
+    // in-flight send if ClaimFailedPayout has no contract left to run against.
+    failedPayoutCount: Int as uint16;
+
+    // V2-N1 fix: counts payouts sent but not yet resolved. _checkAllWithdrawn
+    // must not destroy the vault in the SAME transaction that just queued a
+    // send whose outcome isn't known yet — decremented by bounced(), which TVM
+    // itself authenticates (a bounce can only arrive from the address we sent
+    // to), never by JettonExcesses: that message is sent by the RECIPIENT's own
+    // jetton wallet (a different, arbitrary address we can't cheaply verify),
+    // so trusting it as a "confirmed success" signal would let a forger who
+    // just guesses the next sequential queryId send a fake early confirmation
+    // that suppresses a genuine later bounce-restore. Gated by lastPayoutAt
+    // below instead of held open indefinitely, since a real failure bounces
+    // back promptly — there's nothing to wait an unbounded time for.
+    inFlightPayouts: Int as uint16;
+    // Timestamp of the most recent tracked send. _checkAllWithdrawn only defers
+    // for inFlightPayouts while still within DestroyGraceWindow of this — a TON
+    // bounce for a failed action arrives promptly (same transaction graph), so
+    // once that window has passed with no bounce, it's safe to treat the send
+    // as settled and let the destroy (or a later Reap) proceed.
+    lastPayoutAt: Int as uint32;
 
     // === V2: jetton asset + discovered wallet ===
     jettonMaster:   Address;
@@ -305,6 +341,9 @@ contract EscrowJettonVault with Ownable {
         self.disputeDeadline = 0;
         self.terminalAt      = 0;
         self.withdrawNonce   = 0;
+        self.inFlightPayouts = 0;
+        self.failedPayoutCount = 0;
+        self.lastPayoutAt    = 0;
 
         self.jettonMaster   = newAddress(0, 0);   // placeholder; set by InitVault
         self.myJettonWallet = newAddress(0, 0);   // placeholder; set by TakeWalletAddress
@@ -382,6 +421,11 @@ contract EscrowJettonVault with Ownable {
     // time), the UI or backend can retry discovery without a DAO intervention.
     receive("RetryWalletDiscovery") {
         require(!self.jwResolved, "Wallet already resolved");
+        // V2-N3: permissionless and previously free to call — each call spent
+        // WalletDiscoveryGas out of the vault's own fixed budget, so an attacker
+        // could deplete it well before jwResolved and brick the unattended flow.
+        // Caller now pays for their own retry.
+        require(context().value >= self.WalletDiscoveryGas, "Send at least WalletDiscoveryGas");
         self._requestJettonWallet();
     }
 
@@ -416,29 +460,29 @@ contract EscrowJettonVault with Ownable {
 
         // Wrong phase → refund the whole amount.
         if (self.state != self.StateAwaitingDeposits) {
-            self._sendJettons(from, amt, 0);
+            self._refundDeposit(from, amt);
             return;
         }
 
         if (from == self.buyer) {
-            if (self.buyerDeposited) { self._sendJettons(from, amt, 0); return; }
+            if (self.buyerDeposited) { self._refundDeposit(from, amt); return; }
             let required: Int = self.buyerDepositAmount;
-            if (amt < required) { self._sendJettons(from, amt, 0); return; }
-            if (amt > required) { self._sendJettons(from, amt - required, 0); }
+            if (amt < required) { self._refundDeposit(from, amt); return; }
+            if (amt > required) { self._refundDeposit(from, amt - required); }
             self.buyerDeposited = true;
             emit(EvtDeposit{ tradeId: self.tradeId, depositor: self.buyer, amount: required, isBuyer: true }.toCell());
             self._checkBothDeposited();
         } else if (from == self.seller) {
-            if (self.sellerDeposited) { self._sendJettons(from, amt, 0); return; }
+            if (self.sellerDeposited) { self._refundDeposit(from, amt); return; }
             let required: Int = self.sellerDepositAmount;
-            if (amt < required) { self._sendJettons(from, amt, 0); return; }
-            if (amt > required) { self._sendJettons(from, amt - required, 0); }
+            if (amt < required) { self._refundDeposit(from, amt); return; }
+            if (amt > required) { self._refundDeposit(from, amt - required); }
             self.sellerDeposited = true;
             emit(EvtDeposit{ tradeId: self.tradeId, depositor: self.seller, amount: required, isBuyer: false }.toCell());
             self._checkBothDeposited();
         } else {
             // Not a trade party → refund.
-            self._sendJettons(from, amt, 0);
+            self._refundDeposit(from, amt);
         }
     }
 
@@ -586,6 +630,7 @@ contract EscrowJettonVault with Ownable {
         let qid: Int = self.withdrawNonce;
         self.pendingPayoutType.set(qid, partyType);
         self.pendingPayoutAmount.set(qid, claimable);
+        self.inFlightPayouts = self.inFlightPayouts + 1; // V2-N1: cleared by bounced()/JettonExcesses below
 
         if (partyType == 1)      { self.buyerClaimable           = 0; }
         else if (partyType == 2) { self.sellerClaimable          = 0; }
@@ -603,18 +648,60 @@ contract EscrowJettonVault with Ownable {
         let amt: Int = self.pendingPayoutAmount.get(qid)!!;
         self.pendingPayoutType.del(qid);
         self.pendingPayoutAmount.del(qid);
+        self.inFlightPayouts = self.inFlightPayouts - 1; // V2-N1
         if (partyType == 1)      { self.buyerClaimable           = self.buyerClaimable           + amt; }
         else if (partyType == 2) { self.sellerClaimable          = self.sellerClaimable          + amt; }
-        else                     { self.commissionairesClaimable = self.commissionairesClaimable + amt; }
+        else if (partyType == 3) { self.commissionairesClaimable = self.commissionairesClaimable + amt; }
+        else {
+            // V2-N2: a bounced deposit refund — the recipient isn't necessarily a
+            // trade party (a non-party's mistaken deposit refunds to itself), so
+            // there's no claimable bucket to restore into. Accumulate for
+            // permissionless reclaim instead, exactly like the milestone vault.
+            let to: Address = self.pendingRefundTo.get(qid)!!;
+            self.pendingRefundTo.del(qid);
+            let prior: Int = 0;
+            let isNewEntry: Bool = !self.failedPayout.exists(to);
+            if (!isNewEntry) { prior = self.failedPayout.get(to)!!; }
+            self.failedPayout.set(to, prior + amt);
+            if (isNewEntry) { self.failedPayoutCount = self.failedPayoutCount + 1; }
+        }
+        // The claimable is restored but the vault may already be destroyed if it
+        // was the last one outstanding — Reap only helps a still-live vault, so
+        // there is no further action to take here beyond making the claimable
+        // whole again for whichever destroy path is still reachable.
     }
 
-    // Clean up the pending-payout entry once the jetton wallet confirms delivery.
-    // Only accepted from our own jetton wallet — a forged JettonExcesses cannot
-    // delete a real pending entry and thereby block bounced() from restoring.
+    // Best-effort cleanup only — NOT relied on for correctness. Per TEP-74,
+    // `excesses` is sent by the RECIPIENT's own jetton wallet (an address this
+    // contract has no cheap way to verify for an arbitrary recipient), not by
+    // self.myJettonWallet, so the sender check below means this in practice
+    // only ever matches the narrow case where that happens to coincide. Real
+    // resolution of inFlightPayouts is time-based (lastPayoutAt, see
+    // _checkAllWithdrawn) plus bounced(), which TVM itself authenticates.
+    // Deliberately NOT trusted as a "confirmed success" signal: a forger only
+    // needs to guess the next sequential queryId to send a fake early
+    // confirmation here, which would delete the real pending entry and
+    // suppress a genuine later bounce-restore.
     receive(msg: JettonExcesses) {
         if (sender() != self.myJettonWallet) { return; }
+        if (!self.pendingPayoutType.exists(msg.queryId)) { return; }
+        if (self.pendingPayoutType.get(msg.queryId)!! == 4) {
+            self.pendingRefundTo.del(msg.queryId);
+        }
         self.pendingPayoutType.del(msg.queryId);
         self.pendingPayoutAmount.del(msg.queryId);
+        self.inFlightPayouts = self.inFlightPayouts - 1;
+        self._checkAllWithdrawn();
+    }
+
+    // V2-N2: permissionless retry for a recipient whose deposit refund bounced.
+    receive("ClaimFailedPayout") {
+        let s: Address = sender();
+        require(self.failedPayout.exists(s) && self.failedPayout.get(s)!! > 0, "No failed payout to claim");
+        let amt: Int = self.failedPayout.get(s)!!;
+        self.failedPayout.del(s);
+        self.failedPayoutCount = self.failedPayoutCount - 1;
+        self._refundDeposit(s, amt);
     }
 
     // ========================================
@@ -775,6 +862,7 @@ contract EscrowJettonVault with Ownable {
     // an empty inline payload without throwing.
     fun _sendJettons(to: Address, amount: Int, queryId: Int) {
         if (amount <= 0) { return; }
+        self.lastPayoutAt = now();
         send(SendParameters{
             to:     self.myJettonWallet,
             value:  self.JettonFwdGas,
@@ -790,6 +878,21 @@ contract EscrowJettonVault with Ownable {
                 forwardPayload:      beginCell().storeUint(0, 1).endCell().asSlice()
             }.toCell()
         });
+    }
+
+    // V2-N2: refund a deposit through the same tracked, bounce-recoverable
+    // path as a Withdraw payout, instead of the untracked queryId=0 sends this
+    // replaces. A no-op for amount <= 0, matching _sendJettons' own guard —
+    // callers can call this unconditionally without checking first.
+    fun _refundDeposit(to: Address, amount: Int) {
+        if (amount <= 0) { return; }
+        self.withdrawNonce = self.withdrawNonce + 1;
+        let qid: Int = self.withdrawNonce;
+        self.pendingPayoutType.set(qid, 4); // 4 = refund
+        self.pendingRefundTo.set(qid, to);
+        self.pendingPayoutAmount.set(qid, amount);
+        self.inFlightPayouts = self.inFlightPayouts + 1;
+        self._sendJettons(to, amount, qid);
     }
 
     fun _requestJettonWallet() {
@@ -841,6 +944,21 @@ contract EscrowJettonVault with Ownable {
         if (self.buyerClaimable           == 0 &&
             self.sellerClaimable          == 0 &&
             self.commissionairesClaimable == 0) {
+            // V2-N1: never destroy in the same transaction that just queued a
+            // payout send — a same-tx destroy right after the last claimable's
+            // send would leave a later bounce with no contract left to run
+            // bounced() and restore into. Bounded by lastPayoutAt rather than
+            // held open indefinitely: a real failure bounces back promptly (TVM
+            // delivers it within the same transaction graph), so once
+            // DestroyGraceWindow has passed since the last send with no bounce,
+            // it's safe to treat it as settled — there is nothing reliable to
+            // keep waiting for (see the JettonExcesses receiver above).
+            if (self.inFlightPayouts > 0 && now() < self.lastPayoutAt + self.DestroyGraceWindow) { return; }
+            // V2-N2: unlike inFlightPayouts, this one stays an indefinite gate —
+            // a bounce already confirmed (via TVM, in bounced()) that this money
+            // is owed and sitting in failedPayout; only ClaimFailedPayout should
+            // ever release it, never a timeout.
+            if (self.failedPayoutCount > 0) { return; }
             if (self.terminalAt != 0 && now() < self.terminalAt + self.DestroyGraceWindow) {
                 return; // still inside the grace window — a late deposit can arrive
             }

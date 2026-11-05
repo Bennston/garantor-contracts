@@ -130,6 +130,12 @@ contract EscrowFactory with Ownable {
     pendingTradeValue: map<Int, Int as coins>;
     pendingRefund:    map<Int, Int as coins>;
     pendingTradeByVault: map<Address, Int as uint64>;
+    // V1-4: the vault address at creation time, stored rather than recomputed.
+    // The vault's StateInit derives from self.owner as it was AT DEPLOY TIME —
+    // recomputing it later with contractAddress(initOf EscrowVault(..., self.owner, ...))
+    // uses whatever self.owner is NOW, which silently drifts from the deployed
+    // vault's real address if ChangeOwner lands in the pending window.
+    pendingVaultAddress: map<Int, Address>;
 
     // ========================================
     // Constructor
@@ -156,6 +162,12 @@ contract EscrowFactory with Ownable {
         self.nextTradeId = 1;
     }
 
+    // I-8: plain top-ups previously had no matching receiver — they were only
+    // ever "accepted" by a TVM quirk (a failed compute phase still keeps
+    // non-bounceable value). Accept them for real, matching the milestone
+    // factory's own fallback receive().
+    receive() {}
+
     // ========================================
     // Receiver: CreateEscrow
     receive(msg: CreateEscrow) {
@@ -163,6 +175,12 @@ contract EscrowFactory with Ownable {
         require(msg.tradeValue >= self.minTradeValue, "Trade value below minimum");
         require(msg.tradeValue > 0, "Trade value must be positive");
         require(msg.buyer != msg.seller, "Buyer and seller must differ");
+        // V1-3: commissionairesDao as a trade party aliases every Withdraw from that
+        // address into the seller/buyer branch, so commissionairesClaimable can never
+        // be zeroed and the vault never self-destructs. The milestone factory already
+        // excludes its own owner; this mirrors that exclusion here.
+        require(msg.buyer != self.commissionairesDao && msg.seller != self.commissionairesDao,
+            "Commissionaires DAO cannot be a trade party");
         // SECURITY: require a real future deadline. deadline == 0 (or past) leaves the
         // vault with no CheckExpiry path, so a ghosting seller forces every exit through
         // a dispute. Minimum 1 hour in the future.
@@ -190,6 +208,7 @@ contract EscrowFactory with Ownable {
         self.pendingTradeValue.set(tradeId, msg.tradeValue);
         self.pendingRefund.set(tradeId, msgValue);
         self.pendingTradeByVault.set(vaultAddress, tradeId);
+        self.pendingVaultAddress.set(tradeId, vaultAddress); // V1-4
 
         // Deploy vault and initialize it in a single send
         send(SendParameters{
@@ -247,11 +266,16 @@ contract EscrowFactory with Ownable {
         let tradeId: Int = self.pendingTradeByVault.get(vaultAddress)!!;
 
         let creator: Address = self.pendingCreator.get(tradeId)!!;
+        let paidAmount: Int = self.pendingRefund.get(tradeId)!!;
         let refundableBalance: Int = self.deploymentFee + context().value - ton("0.02");
         if (refundableBalance < 0) {
             refundableBalance = 0;
         }
-        let refundAmount: Int = min(self.pendingRefund.get(tradeId)!!, refundableBalance);
+        let refundAmount: Int = min(paidAmount, refundableBalance);
+        // V1-5: the slice we don't refund (retained gas/deployment-fee residue)
+        // was previously neither refunded nor credited — WithdrawFees caps at
+        // totalFeesCollected, so it sat in the balance unreachable forever.
+        self.totalFeesCollected = self.totalFeesCollected + (paidAmount - refundAmount);
 
         send(SendParameters{
             to: creator,
@@ -307,13 +331,17 @@ contract EscrowFactory with Ownable {
     }
 
     fun clearPendingTrade(tradeId: Int) {
-        let vaultAddress: Address = contractAddress(initOf EscrowVault(myAddress(), self.owner, tradeId));
+        // V1-4: use the address stored at creation time, not a recomputation —
+        // self.owner may have changed since, which would silently derive the
+        // wrong address and leave the real entry in pendingTradeByVault stale.
+        let vaultAddress: Address = self.pendingVaultAddress.get(tradeId)!!;
         self.pendingBuyer.del(tradeId);
         self.pendingSeller.del(tradeId);
         self.pendingCreator.del(tradeId);
         self.pendingTradeValue.del(tradeId);
         self.pendingRefund.del(tradeId);
         self.pendingTradeByVault.del(vaultAddress);
+        self.pendingVaultAddress.del(tradeId);
     }
 
     // ========================================
@@ -372,7 +400,12 @@ contract EscrowFactory with Ownable {
 
     receive(msg: UpdateTimelockDelay) {
         self.requireOwner();
-        require(msg.newDelay >= 3600, "Timelock delay minimum is 1 hour");
+        // Floored at 24h, not 1h: this delay is itself instant to change, so a
+        // low floor lets a compromised/malicious owner shrink the "24h" guarantee
+        // on deploymentFee/minTradeValue/commissionPercent/guaranteePercent down to
+        // ~1h right before scheduling a change (V1-2; same pattern V2 fixed at
+        // escrow_jetton_factory.tact's UpdateTimelockDelay).
+        require(msg.newDelay >= 86400, "Timelock delay minimum is 24h");
         self.timelockDelay = msg.newDelay;
         cashback(sender());
     }
@@ -456,6 +489,14 @@ contract EscrowFactory with Ownable {
 
     get fun deploymentFeeAmount(): Int {
         return self.deploymentFee;
+    }
+
+    // minTradeValue is admin-adjustable (see UpdateParam, param opcode 2) but
+    // wasn't previously exposed to callers, so the frontend had no way to read
+    // the real live minimum and fell back to a hardcoded guess that could
+    // silently drift from what the factory would actually accept.
+    get fun minTradeValueAmount(): Int {
+        return self.minTradeValue;
     }
 
     // Compute the vault address for a given tradeId (useful for off-chain lookups)

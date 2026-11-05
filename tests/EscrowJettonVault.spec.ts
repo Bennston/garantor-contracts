@@ -1,7 +1,7 @@
 import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
-import { toNano, Address, beginCell } from '@ton/core';
+import { toNano, Address, beginCell, internal } from '@ton/core';
 import { EscrowJettonFactory } from '../build/EscrowJettonFactory/tact_EscrowJettonFactory';
-import { EscrowJettonVault } from '../build/EscrowJettonVault/tact_EscrowJettonVault';
+import { EscrowJettonVault, storeJettonTransfer } from '../build/EscrowJettonVault/tact_EscrowJettonVault';
 import { MockJettonMaster } from '../build/MockJettonMaster/tact_MockJettonMaster';
 import { MockJettonWallet } from '../build/MockJettonMaster/tact_MockJettonWallet';
 import '@ton/test-utils';
@@ -177,6 +177,89 @@ describe('EscrowJettonVault (V2 / USDT)', () => {
         expect(await balanceOf(vault.address)).toBe(0n);
     });
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // [V2-N1] Regression: the last withdrawal's own payout bouncing must not
+    // find the vault already self-destructed. Pre-fix, _checkAllWithdrawn ran
+    // synchronously right after dispatching the last claimant's JettonTransfer
+    // (queued for the action phase, not yet resolved) and, once past the
+    // 1h DestroyGraceWindow, queued the self-destruct in the SAME transaction.
+    // A later bounce (jetton wallet temporarily unavailable) would then arrive
+    // at a destroyed address, never run bounced(), and strand the jettons at
+    // the vault's own wallet forever. The fix: inFlightPayouts gates the destroy
+    // until the payout resolves one way or the other.
+    // ─────────────────────────────────────────────────────────────────────────
+    it('[V2-N1] a bounced final withdrawal restores claimable instead of racing self-destruct', async () => {
+        await depositJettons(buyer, TRADE);
+        await depositJettons(seller, GUARANTEE);
+        await vault.send(seller.getSender(), { value: toNano('0.1') }, {
+            $$type: 'SellerConfirmDelivery', docHash: DOC_HASH,
+        });
+        await vault.send(buyer.getSender(), { value: toNano('0.1') }, {
+            $$type: 'BuyerConfirmReceipt', docHash: DOC_HASH,
+        });
+        expect((await vault.getVaultState()).state).toBe(3n); // SUCCESSFUL
+
+        // Commissionaires withdraw first, leaving the seller as the LAST claimant —
+        // the one whose Withdraw will see all-zero claimables and attempt to close.
+        await withdraw(commissionaires);
+
+        // Past the 1h destroy grace window, so _checkAllWithdrawn's only remaining
+        // gate (pre-fix) was the claimables-all-zero check.
+        blockchain.now = NOW + 3700;
+
+        // Drive the seller's Withdraw one hop via a raw iterator so we can inspect
+        // the vault immediately after it queues the payout — before that payout's
+        // JettonTransfer is actually delivered to (and would normally succeed at)
+        // the jetton wallet.
+        const withdrawBody = beginCell().storeUint(0x1007, 32).endCell(); // Withdraw{}
+        const relaxed = internal({ to: vault.address, value: toNano('0.15'), body: withdrawBody, bounce: true });
+        const iter = await blockchain.sendMessageIter(
+            { info: { ...relaxed.info, src: seller.address }, body: relaxed.body } as any,
+            { allowParallel: true },
+        );
+        await iter.next(); // processes only the Withdraw transaction itself
+
+        // The vault must still be alive: pre-fix, this same transaction would
+        // already have queued its own self-destruct alongside the payout send.
+        const midState = await vault.getVaultState();
+        expect(midState.sellerClaimable).toBe(0n); // zeroed before the (still in-flight) send
+
+        // Simulate that in-flight JettonTransfer bouncing back from the wallet.
+        // withdrawNonce starts at 0; commissionaires' Withdraw above consumed
+        // qid 1, so the seller's is qid 2. Bounce-truncation to 256 bits isn't
+        // reproduced bit-for-bit here — the point under test is bounced()'s own
+        // increment/restore logic, not TVM's truncation rule — so the body carries
+        // the same fields _sendJettons actually sent, prefixed with the bounce tag.
+        const originalSend = beginCell().store(storeJettonTransfer({
+            $$type: 'JettonTransfer',
+            queryId: 2n,
+            amount: SELLER_PAYOUT,
+            destination: seller.address,
+            responseDestination: vault.address,
+            customPayload: null,
+            forwardTonAmount: 0n,
+            forwardPayload: EMPTY_FWD,
+        })).endCell();
+        const bounceBody = beginCell().storeUint(0xFFFFFFFF, 32).storeSlice(originalSend.asSlice()).endCell();
+        const bounceMsg = internal({ to: vault.address, value: toNano('0.05'), body: bounceBody, bounce: false });
+        await blockchain.sendMessage({
+            info: { ...bounceMsg.info, src: await vault.getJettonWallet(), bounced: true },
+            body: bounceMsg.body,
+        } as any);
+
+        // Vault survived the bounce (still queryable) and restored the claimable —
+        // the exact outcome the pre-fix same-tx destroy would have made unreachable.
+        const afterBounce = await vault.getVaultState();
+        expect(afterBounce.sellerClaimable).toBe(SELLER_PAYOUT);
+
+        // The restored claimable is retryable — a fresh Withdraw now succeeds and
+        // the vault correctly self-destructs once this genuinely last payout confirms.
+        // Jetton value moves wallet-to-wallet, not vault-to-seller directly, so
+        // the final balance is the proof the retried payout actually landed.
+        await withdraw(seller);
+        expect(await balanceOf(seller.address)).toBe(USDT(100) - GUARANTEE + SELLER_PAYOUT);
+    });
+
     it('refunds the excess on an over-deposit', async () => {
         await depositJettons(buyer, USDT(12));   // required is 10
         const st = await vault.getVaultState();
@@ -198,6 +281,77 @@ describe('EscrowJettonVault (V2 / USDT)', () => {
         // Stranger's jettons came straight back.
         expect(await balanceOf(stranger.address)).toBe(USDT(5));
         expect(await balanceOf(vault.address)).toBe(0n);
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // [V2-N2] Regression: a bounced deposit refund used to share queryId=0 with
+    // no pending-map entry at all, so a bounce (recipient frozen/destroyed
+    // between deposit and refund) returned to the vault's own wallet with no
+    // record and no recovery. Now it's tracked like a Withdraw payout: a
+    // synthetic bounce for the refund's queryId must accumulate into
+    // failedPayout instead of vanishing, and ClaimFailedPayout must recover it.
+    // ─────────────────────────────────────────────────────────────────────────
+    it('[V2-N2] a bounced deposit refund is recoverable via ClaimFailedPayout', async () => {
+        await mint(stranger.address, USDT(5));
+
+        // Drive the stranger's deposit one hop via a raw iterator so we can
+        // inspect right after the vault queues its refund send — before that
+        // refund is actually delivered to (and would normally succeed at) the
+        // vault's own jetton wallet.
+        const strangerWallet = await walletOf(stranger.address);
+        const depositBody = beginCell().store(storeJettonTransfer({
+            $$type: 'JettonTransfer',
+            queryId: 0n,
+            amount: USDT(5),
+            destination: vault.address,
+            responseDestination: stranger.address,
+            customPayload: null,
+            forwardTonAmount: toNano('0.1'),
+            forwardPayload: EMPTY_FWD,
+        })).endCell();
+        const relaxed = internal({ to: strangerWallet.address, value: toNano('0.3'), body: depositBody, bounce: true });
+        const iter = await blockchain.sendMessageIter(
+            { info: { ...relaxed.info, src: stranger.address }, body: relaxed.body } as any,
+            { allowParallel: true },
+        );
+        // Hop 1: stranger -> stranger's wallet (JettonTransfer)
+        // Hop 2: stranger's wallet -> vault's wallet (JettonInternalTransfer)
+        // Hop 3: vault's wallet -> vault (JettonTransferNotification) — the vault
+        //        queues its refund send here (withdrawNonce -> qid 1) and stops,
+        //        leaving that refund undelivered in the iterator's queue.
+        await iter.next();
+        await iter.next();
+        await iter.next();
+
+        // Simulate that in-flight refund bouncing back from the vault's wallet.
+        const originalSend = beginCell().store(storeJettonTransfer({
+            $$type: 'JettonTransfer',
+            queryId: 1n,
+            amount: USDT(5),
+            destination: stranger.address,
+            responseDestination: vault.address,
+            customPayload: null,
+            forwardTonAmount: 0n,
+            forwardPayload: EMPTY_FWD,
+        })).endCell();
+        const bounceBody = beginCell().storeUint(0xFFFFFFFF, 32).storeSlice(originalSend.asSlice()).endCell();
+        const bounceMsg = internal({ to: vault.address, value: toNano('0.05'), body: bounceBody, bounce: false });
+        await blockchain.sendMessage({
+            info: { ...bounceMsg.info, src: await vault.getJettonWallet(), bounced: true },
+            body: bounceMsg.body,
+        } as any);
+
+        // Nothing is claimable — this was never a trade party's Withdraw — but
+        // the reclaim must now succeed instead of the refund being lost.
+        expect(await balanceOf(stranger.address)).toBe(0n);
+        await vault.send(stranger.getSender(), { value: toNano('0.1') }, 'ClaimFailedPayout');
+        expect(await balanceOf(stranger.address)).toBe(USDT(5));
+
+        // A second claim with nothing pending must fail, not silently no-op.
+        const second = await vault.send(stranger.getSender(), { value: toNano('0.1') }, 'ClaimFailedPayout');
+        expect(second.transactions).toHaveTransaction({
+            from: stranger.address, to: vault.address, success: false,
+        });
     });
 
     it('cancels cleanly before any deposit, deferring self-destruct until the grace window elapses', async () => {

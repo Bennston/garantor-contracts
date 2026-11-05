@@ -397,6 +397,110 @@ describe('EscrowVaultMilestone — Urea N46% Smoke Tests', () => {
     });
 
     // ─────────────────────────────────────────────────────────────────────────
+    // [V1-1] Regression: a gas-starved vault must revert a payout instead of
+    // silently stranding funds. Reproduces the audit's Scenario A ingredients —
+    // zero performance bond and a thin 0.25 TON float (the pre-fix factory
+    // minimum) — through both milestones being disputed and arbitrated. Fixed
+    // overhead (ack 0.05 + 2×arbitratorFee 0.1 + compute/forward gas) exceeds
+    // that float, so the second ArbitratorResolveMilestone must fail cleanly:
+    // no state advance, no funds moved, and the vault must stay open so it can
+    // be topped up and retried instead of getting permanently CLOSED with a
+    // stranded balance no receiver can ever reach again.
+    // ─────────────────────────────────────────────────────────────────────────
+    it('[V1-1] underfunded dispute payout reverts instead of stranding funds, and recovers after top-up', async () => {
+        const thinFloat = toNano('0.1'); // thinner than even the pre-fix factory minimum (0.25 TON)
+
+        const initResult = await vault.send(
+            factory.getSender(),
+            { value: thinFloat },
+            {
+                $$type:            'InitMilestoneVault',
+                tradeId:           TRADE_ID,
+                buyer:             buyer.address,
+                seller:            seller.address,
+                arbitrator:        arbitrator.address,
+                referrer:          referrer.address,
+                referrerFeeBps:    0n, // isolate the scenario from referrer-fee accounting
+                milestoneCount:    2n,
+                m0Value:           M0_VALUE,
+                m1Value:           M1_VALUE,
+                m0Window:          BigInt(M0_REVIEW_WINDOW),
+                m1Window:          BigInt(M1_REVIEW_WINDOW),
+                m0DeliveryWindow:  BigInt(M0_DELIVERY_WINDOW),
+                m1DeliveryWindow:  BigInt(M1_DELIVERY_WINDOW),
+                arbitratorFee:     ARBITRATOR_FEE,
+                performanceBond:   0n, // audit's Scenario A: factory never validates bond > 0
+                tradeRef:          'V1-1 regression: thin float',
+            }
+        );
+        expect(initResult.transactions).toHaveTransaction({ from: factory.address, to: vault.address, success: true });
+
+        // Buyer/seller deposit EXACT principal. Every other message below carries
+        // only a minimal, realistic gas top-up (0.01-0.02 TON) — anything more
+        // would itself refill the "thin" float and mask the scenario, since a
+        // state-only message (no outbound send) leaves nearly all of its incoming
+        // value sitting in the vault's balance.
+        await vault.send(buyer.getSender(), { value: TOTAL_VALUE }, 'DepositPayment');
+        await vault.send(seller.getSender(), { value: toNano('0.03') }, 'DepositBond');
+        expect(await vault.getVaultState()).toBe(1n); // ACTIVE
+
+        // M0: disputed, arbitrator rules for seller (no bond to slash — it's zero)
+        await vault.send(seller.getSender(), { value: toNano('0.03') },
+            { $$type: 'SellerConfirmMilestone', index: 0n, docHash: MOCK_BL_HASH });
+        await vault.send(buyer.getSender(), { value: toNano('0.03') },
+            { $$type: 'BuyerDisputeMilestone', index: 0n, reason: 'dispute 1' });
+        await vault.send(arbitrator.getSender(), { value: toNano('0.05') },
+            { $$type: 'ArbitratorResolveMilestone', index: 0n, releaseToSeller: true });
+        expect(await vault.getM0State()).toBe(2n); // DONE
+
+        // M1: disputed — this is the close-triggering arbitration that should
+        // exhaust the thin float (ack + 2 arbitrator fees + gas > 0.25 TON).
+        await vault.send(seller.getSender(), { value: toNano('0.03') },
+            { $$type: 'SellerConfirmMilestone', index: 1n, docHash: MOCK_SGS_HASH });
+        await vault.send(buyer.getSender(), { value: toNano('0.03') },
+            { $$type: 'BuyerDisputeMilestone', index: 1n, reason: 'dispute 2' });
+
+        const vaultBalanceBefore = (await blockchain.getContract(vault.address)).balance;
+
+        const starvedResolve = await vault.send(arbitrator.getSender(), { value: toNano('0.05') },
+            { $$type: 'ArbitratorResolveMilestone', index: 1n, releaseToSeller: true });
+
+        // Must revert — not silently succeed with the payout skipped.
+        expect(starvedResolve.transactions).toHaveTransaction({
+            from: arbitrator.address, to: vault.address, success: false,
+        });
+
+        // State must NOT have advanced: still DISPUTED/ACTIVE, never DONE/CLOSED.
+        expect(await vault.getM1State()).toBe(3n);    // still DISPUTED
+        expect(await vault.getVaultState()).toBe(1n); // still ACTIVE, not CLOSED
+
+        // Balance is essentially unchanged — only the failed attempt's own compute
+        // gas was consumed, no value left this transaction.
+        const vaultBalanceAfterFailedAttempt = (await blockchain.getContract(vault.address)).balance;
+        expect(vaultBalanceAfterFailedAttempt).toBeGreaterThan(vaultBalanceBefore - toNano('0.05'));
+
+        // ── Recovery: anyone can top up the vault via the new fallback receiver ──
+        await vault.send(buyer.getSender(), { value: toNano('1') }, null);
+
+        const sellerBefore = await seller.getBalance();
+        const retryResolve = await vault.send(arbitrator.getSender(), { value: toNano('0.05') },
+            { $$type: 'ArbitratorResolveMilestone', index: 1n, releaseToSeller: true });
+
+        expect(retryResolve.transactions).toHaveTransaction({
+            from: arbitrator.address, to: vault.address, success: true,
+        });
+        // Retry closes the vault (both milestones now DONE) and self-destructs it —
+        // same as the happy-path close, so there's no contract left to query getters
+        // against; the seller payout is the proof the retry actually completed.
+        expect(retryResolve.transactions).toHaveTransaction({
+            from: vault.address, to: seller.address, success: true,
+        });
+
+        const sellerAfter = await seller.getBalance();
+        expect(sellerAfter - sellerBefore).toBeGreaterThan(M1_VALUE - toNano('0.1'));
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
     // TEST 5: BuyerClaimAbandoned — seller misses M0 delivery deadline
     // ─────────────────────────────────────────────────────────────────────────
     it('buyer can claim abandoned if seller misses M0 delivery deadline', async () => {

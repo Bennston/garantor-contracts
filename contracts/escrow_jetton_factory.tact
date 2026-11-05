@@ -491,6 +491,10 @@ contract EscrowJettonFactory with Ownable {
     get fun totalVaults(): Int { return self.totalVaultsDeployed; }
     get fun deploymentFeeAmount(): Int { return self.deploymentFee; }
     get fun jettonMasterAddr(): Address { return self.jettonMaster; }
+    // minTradeValue is already in factoryConfig(), but that's a struct getter;
+    // this plain-Int getter mirrors EscrowFactory.minTradeValueAmount() so the
+    // frontend can fetch both factories' live minimums with the same call shape.
+    get fun minTradeValueAmount(): Int { return self.minTradeValue; }
 
     get fun vaultAddress(tradeId: Int): Address {
         let vaultInit: StateInit = initOf EscrowJettonVault(myAddress(), tradeId);

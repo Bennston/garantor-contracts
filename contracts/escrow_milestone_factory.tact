@@ -168,8 +168,13 @@ contract EscrowMilestoneFactory with Ownable {
         // Validate minimum trade value
         require(total >= self.minTradeValue, "Trade value below minimum");
 
-        // Require deployment fee + gas (factory compute + vault deploy)
-        require(msgValue >= self.deploymentFee + ton("0.25"), "Insufficient value: send deploymentFee + 0.25 TON gas");
+        // Require deployment fee + gas (factory compute + vault deploy).
+        // 0.6 TON covers the vault's fixed lifecycle outflows even in the worst case
+        // (both milestones disputed and arbitrated): the InitOk ack (0.05) + up to two
+        // arbitratorFee payouts (capped at 0.1 each, see UpdateArbitratorFee) + normal
+        // compute/forward gas across ~10-15 messages + tradeRef storage rent, with
+        // headroom left over as the vault's GasReserve float for its own payout guards.
+        require(msgValue >= self.deploymentFee + ton("0.6"), "Insufficient value: send deploymentFee + 0.6 TON gas");
 
         let tradeId: Int = self.nextTradeId;
         self.nextTradeId = self.nextTradeId + 1;
@@ -183,7 +188,9 @@ contract EscrowMilestoneFactory with Ownable {
         send(SendParameters{
             to:     vaultAddress,
             value:  msgValue - self.deploymentFee,  // keep deployment fee, forward rest
-            mode:   0,                      // revert on action-phase failure
+            mode:   0,                      // ordinary message; bounce:true below returns
+                                             // the value here if the vault's init reverts —
+                                             // mode alone does not roll back compute state
             bounce: true,
             code:   vaultInit.code,
             data:   vaultInit.data,
@@ -255,11 +262,15 @@ contract EscrowMilestoneFactory with Ownable {
         let tradeId: Int = self.pendingTradeByVault.get(vaultAddress)!!;
 
         let creator: Address = self.pendingCreator.get(tradeId)!!;
+        let paidAmount: Int = self.pendingRefund.get(tradeId)!!;
         let refundableBalance: Int = self.deploymentFee + context().value - ton("0.02");
         if (refundableBalance < 0) {
             refundableBalance = 0;
         }
-        let refundAmount: Int = min(self.pendingRefund.get(tradeId)!!, refundableBalance);
+        let refundAmount: Int = min(paidAmount, refundableBalance);
+        // V1-5: credit the retained slice instead of leaving it stuck above
+        // WithdrawFees' totalFeesCollected cap forever.
+        self.totalFeesCollected = self.totalFeesCollected + (paidAmount - refundAmount);
 
         send(SendParameters{
             to: creator,
@@ -395,7 +406,10 @@ contract EscrowMilestoneFactory with Ownable {
 
     receive(msg: UpdateTimelockDelay) {
         self.requireOwner();
-        require(msg.newDelay >= 3600, "Timelock delay minimum is 1 hour");
+        // Floored at 24h — see V1-2 in the audit. A 1h floor here let a
+        // compromised owner shrink the deploymentFee/minTradeValue timelock's
+        // "24h" guarantee down to ~1h right before scheduling a change.
+        require(msg.newDelay >= 86400, "Timelock delay minimum is 24h");
         self.timelockDelay = msg.newDelay;
         cashback(sender());
     }
@@ -407,6 +421,11 @@ contract EscrowMilestoneFactory with Ownable {
     receive(msg: UpdateArbitratorFee) {
         self.requireOwner();
         require(msg.newArbitratorFee >= 0, "Arbitrator fee cannot be negative");
+        // Capped so an uncapped fee can never eat into the milestone value or bond
+        // return on its own — up to two of these are paid per trade (one per
+        // milestone dispute) out of the vault's fixed gas float (see
+        // CreateMilestoneVault's deploymentFee + 0.6 TON requirement above).
+        require(msg.newArbitratorFee <= ton("0.1"), "Arbitrator fee exceeds maximum (0.1 TON)");
         self.arbitratorFee = msg.newArbitratorFee;
         cashback(sender());
     }

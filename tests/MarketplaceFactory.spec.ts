@@ -1,7 +1,7 @@
 import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
-import { toNano, Address, beginCell, Cell } from '@ton/core';
+import { toNano, Address, beginCell, Cell, internal } from '@ton/core';
 import { keyPairFromSeed, sign, KeyPair } from '@ton/crypto';
-import { MarketplaceFactory } from '../build/MarketplaceFactory/tact_MarketplaceFactory';
+import { MarketplaceFactory, storeCreateListing } from '../build/MarketplaceFactory/tact_MarketplaceFactory';
 import { MarketplaceListing } from '../build/MarketplaceListing/tact_MarketplaceListing';
 import { EscrowOracleVault } from '../build/EscrowOracleVault/tact_EscrowOracleVault';
 import { OracleRegistry } from '../build/OracleRegistry/tact_OracleRegistry';
@@ -66,16 +66,26 @@ describe('MarketplaceFactory (V3: factory → listing → vault)', () => {
     };
 
     // Must cover deploymentFee (4 TON) + ListingGasBudget (0.1) + buffer.
-    const createListing = async (who: SandboxContract<TreasuryContract>, supply: number, nonce: bigint) =>
+    const createListing = async (
+        who: SandboxContract<TreasuryContract>,
+        supply: number | bigint,
+        nonce: bigint,
+        opts: { minOrderQty?: bigint; maxOrderQty?: bigint; price?: bigint } = {},
+    ) =>
         factory.send(who.getSender(), { value: toNano('4.3') }, {
             $$type: 'CreateListing',
-            pricePerUnit: PRICE,
+            pricePerUnit: opts.price ?? PRICE,
             initialSupply: BigInt(supply),
+            minOrderQty: opts.minOrderQty ?? 0n,   // V3.1
+            maxOrderQty: opts.maxOrderQty ?? 0n,   // V3.1
             validationType: BigInt(VTYPE),
             settlementMode: 0n,   // oracle-only
             agreementCID: null,
             nonce,
         });
+
+    const openListing = async (id: bigint) =>
+        blockchain.openContract(await MarketplaceListing.fromInit(factory.address, master.address, id));
 
     beforeEach(async () => {
         blockchain = await Blockchain.create();
@@ -113,7 +123,7 @@ describe('MarketplaceFactory (V3: factory → listing → vault)', () => {
         expect(await factory.getSellerListingAtIndex(seller.address, 0n)).toBe(1n);
 
         const listing = blockchain.openContract(await MarketplaceListing.fromInit(
-            factory.address, dao.address, master.address, registry.address, commissionaires.address, 1n,
+            factory.address, master.address, 1n,
         ));
         expect(listing.address.equals(await factory.getListingAddress(1n))).toBe(true);
 
@@ -128,11 +138,11 @@ describe('MarketplaceFactory (V3: factory → listing → vault)', () => {
     it('full stack: factory → listing → purchase → deposit → DON settle pays the seller', async () => {
         await createListing(seller, 2, 1n);
         const listing = blockchain.openContract(await MarketplaceListing.fromInit(
-            factory.address, dao.address, master.address, registry.address, commissionaires.address, 1n,
+            factory.address, master.address, 1n,
         ));
 
         // Buyer purchases a unit → listing deploys a seeded oracle vault.
-        await listing.send(buyer.getSender(), { value: toNano('0.6') }, { $$type: 'PurchaseListing', nonce: 1n });
+        await listing.send(buyer.getSender(), { value: toNano('0.6') }, { $$type: 'PurchaseListing', nonce: 1n, quantity: 1n });
         expect(await listing.getRemainingSupply()).toBe(1n);
 
         const vault = blockchain.openContract(await EscrowOracleVault.fromInit(listing.address, dao.address, 1n));
@@ -179,7 +189,7 @@ describe('MarketplaceFactory (V3: factory → listing → vault)', () => {
         expect(await factory.getSellerListingAtIndex(seller2.address, 0n)).toBe(2n);
 
         const l2 = blockchain.openContract(await MarketplaceListing.fromInit(
-            factory.address, dao.address, master.address, registry.address, commissionaires.address, 2n,
+            factory.address, master.address, 2n,
         ));
         const cfg = await l2.getConfig();
         expect(cfg.seller.equals(seller2.address)).toBe(true);
@@ -202,7 +212,8 @@ describe('MarketplaceFactory (V3: factory → listing → vault)', () => {
     it('rejects a CreateListing that underpays the deployment fee', async () => {
         const under = await factory.send(seller.getSender(), { value: toNano('2') }, {
             $$type: 'CreateListing',
-            pricePerUnit: PRICE, initialSupply: 3n, validationType: BigInt(VTYPE),
+            pricePerUnit: PRICE, initialSupply: 3n, minOrderQty: 0n, maxOrderQty: 0n,
+            validationType: BigInt(VTYPE),
             settlementMode: 0n, agreementCID: null, nonce: 9n,
         });
         expect(under.transactions).toHaveTransaction({ from: seller.address, to: factory.address, success: false });
@@ -226,7 +237,8 @@ describe('MarketplaceFactory (V3: factory → listing → vault)', () => {
         // A create that would have bounced at 4 TON now succeeds at 1.3 TON.
         await factory.send(seller.getSender(), { value: toNano('1.3') }, {
             $$type: 'CreateListing',
-            pricePerUnit: PRICE, initialSupply: 3n, validationType: BigInt(VTYPE),
+            pricePerUnit: PRICE, initialSupply: 3n, minOrderQty: 0n, maxOrderQty: 0n,
+            validationType: BigInt(VTYPE),
             settlementMode: 0n, agreementCID: null, nonce: 11n,
         });
         expect(await factory.getTotalListings()).toBe(1n);
@@ -276,5 +288,265 @@ describe('MarketplaceFactory (V3: factory → listing → vault)', () => {
         const bad = await factory.send(dao.getSender(), { value: toNano('0.05') }, { $$type: 'WithdrawFees' });
         expect(bad.transactions).toHaveTransaction({ from: dao.address, to: factory.address, success: false });
         expect((await factory.getConfig()).totalFeesCollected).toBe(toNano('4'));
+    });
+
+    it('M2: a listing address stays stable after UpdateOracleRegistry (derives only from immutable params)', async () => {
+        await createListing(seller, 3, 1n);
+        const before = await factory.getListingAddress(1n);
+
+        // Migrate the oracle registry — an admin op the factory deliberately provides.
+        const newRegistry = await blockchain.treasury('newRegistry');
+        await factory.send(dao.getSender(), { value: toNano('0.05') }, {
+            $$type: 'UpdateOracleRegistry', newRegistry: newRegistry.address,
+        });
+
+        // The existing listing's address must be unchanged, and still resolve to the
+        // live deployed listing — pre-fix this getter re-derived to a dead address.
+        const after = await factory.getListingAddress(1n);
+        expect(after.equals(before)).toBe(true);
+        const listing = blockchain.openContract(await MarketplaceListing.fromInit(factory.address, master.address, 1n));
+        expect(listing.address.equals(after)).toBe(true);
+        expect((await listing.getConfig()).active).toBe(true);
+    });
+
+    it('renewal fees flow through the factory accounting (totalFeesCollected), like creation fees', async () => {
+        await createListing(seller, 3, 1n);
+        expect((await factory.getConfig()).totalFeesCollected).toBe(toNano('4'));   // creation fee only
+
+        const listing = blockchain.openContract(await MarketplaceListing.fromInit(factory.address, master.address, 1n));
+        const expiryBefore = await listing.getExpiresAt();
+
+        // Seller renews; a factory-created listing's renewFee equals the deploymentFee (4 TON).
+        const res = await listing.send(seller.getSender(), { value: toNano('4.3') }, { $$type: 'RenewListing' });
+        // The fee went to the factory (owner), NOT straight to the DAO.
+        expect(res.transactions).toHaveTransaction({ from: listing.address, to: factory.address, success: true });
+
+        // ...and was credited to the factory's fee accounting.
+        expect((await factory.getConfig()).totalFeesCollected).toBeGreaterThan(toNano('7.9'));   // ~4 creation + ~4 renewal
+        expect(await listing.getExpiresAt()).toBeGreaterThan(expiryBefore);
+    });
+
+    it('marketplace-wide pause blocks new listings; owner-only; resumable', async () => {
+        expect(await factory.getPaused()).toBe(false);
+
+        // Non-owner cannot pause.
+        const badPause = await factory.send(seller.getSender(), { value: toNano('0.05') }, { $$type: 'SetMarketplacePaused', paused: true });
+        expect(badPause.transactions).toHaveTransaction({ from: seller.address, to: factory.address, success: false });
+        expect(await factory.getPaused()).toBe(false);
+
+        // Owner pauses.
+        await factory.send(dao.getSender(), { value: toNano('0.05') }, { $$type: 'SetMarketplacePaused', paused: true });
+        expect(await factory.getPaused()).toBe(true);
+
+        // CreateListing is now refused (no new listing recorded).
+        const blocked = await createListing(seller, 3, 77n);
+        expect(blocked.transactions).toHaveTransaction({ from: seller.address, to: factory.address, success: false });
+        expect(await factory.getTotalListings()).toBe(0n);
+
+        // Owner resumes → creation works again.
+        await factory.send(dao.getSender(), { value: toNano('0.05') }, { $$type: 'SetMarketplacePaused', paused: false });
+        expect(await factory.getPaused()).toBe(false);
+        await createListing(seller, 3, 78n);
+        expect(await factory.getTotalListings()).toBe(1n);
+    });
+
+    // ── V3.1: quantity params + tunable protocol params ──────────────────────
+    describe('V3.1 factory params', () => {
+        it('29: CreateListing forwards minOrderQty/maxOrderQty to the listing', async () => {
+            await createListing(seller, 1000, 1n, { minOrderQty: 50n, maxOrderQty: 500n });
+            const l = await openListing(1n);
+            expect(await l.getMinOrderQty()).toBe(50n);
+            expect(await l.getMaxOrderQty()).toBe(500n);
+            const cfg = await l.getConfig();
+            expect(cfg.initialSupply).toBe(1000n);
+            expect(cfg.remainingSupply).toBe(1000n);
+        });
+
+        it('30: CreateListing rejects maxOrderQty < minOrderQty', async () => {
+            const bad = await createListing(seller, 1000, 2n, { minOrderQty: 100n, maxOrderQty: 50n });
+            expect(bad.transactions).toHaveTransaction({ from: seller.address, to: factory.address, success: false });
+            expect(await factory.getTotalListings()).toBe(0n);
+        });
+
+        it('31: new listings inherit the factory default params (2% / 1% / 48h / 30d / 1h)', async () => {
+            await createListing(seller, 10, 3n);
+            const l = await openListing(1n);
+            expect(await l.getListingGuaranteePercent()).toBe(2n);
+            expect(await l.getListingCommissionPercent()).toBe(1n);
+            expect(await l.getListingObjectionWindow()).toBe(172800n);
+            expect(await l.getListingDisputeTimeoutWindow()).toBe(2592000n);
+            expect(await l.getListingDestroyGraceWindow()).toBe(3600n);
+        });
+
+        it('32: UpdateListingParams retunes FUTURE listings only', async () => {
+            await createListing(seller, 10, 1n);                     // listing A: defaults
+            await factory.send(dao.getSender(), { value: toNano('0.05') }, {
+                $$type: 'UpdateListingParams',
+                guaranteePercent: 5n, commissionPercent: 255n,       // 255 = leave commission unchanged
+                deadlineWindow: 0n, listingWindow: 0n,
+                objectionWindow: 3600n, disputeTimeoutWindow: 0n, destroyGraceWindow: 0n,
+            });
+            await createListing(await blockchain.treasury('seller2'), 10, 1n);   // listing B: retuned
+
+            const a = await openListing(1n);
+            const b = await openListing(2n);
+            expect(await a.getListingGuaranteePercent()).toBe(2n);   // unchanged
+            expect(await a.getListingObjectionWindow()).toBe(172800n);
+            expect(await b.getListingGuaranteePercent()).toBe(5n);   // retuned
+            expect(await b.getListingObjectionWindow()).toBe(3600n);
+        });
+
+        it('33: commissionPercent sentinel — 0 is a real change, 255 is "unchanged"', async () => {
+            await factory.send(dao.getSender(), { value: toNano('0.05') }, {
+                $$type: 'UpdateListingParams',
+                guaranteePercent: 0n, commissionPercent: 0n,        // set commission to 0%
+                deadlineWindow: 0n, listingWindow: 0n,
+                objectionWindow: 0n, disputeTimeoutWindow: 0n, destroyGraceWindow: 0n,
+            });
+            expect((await factory.getConfig()).commissionPercent).toBe(0n);
+
+            await factory.send(dao.getSender(), { value: toNano('0.05') }, {
+                $$type: 'UpdateListingParams',
+                guaranteePercent: 0n, commissionPercent: 255n,      // unchanged
+                deadlineWindow: 0n, listingWindow: 0n,
+                objectionWindow: 0n, disputeTimeoutWindow: 0n, destroyGraceWindow: 0n,
+            });
+            expect((await factory.getConfig()).commissionPercent).toBe(0n);
+        });
+
+        it('34: UpdateListingParams is owner-only', async () => {
+            const bad = await factory.send(seller.getSender(), { value: toNano('0.05') }, {
+                $$type: 'UpdateListingParams',
+                guaranteePercent: 5n, commissionPercent: 255n,
+                deadlineWindow: 0n, listingWindow: 0n,
+                objectionWindow: 0n, disputeTimeoutWindow: 0n, destroyGraceWindow: 0n,
+            });
+            expect(bad.transactions).toHaveTransaction({ from: seller.address, to: factory.address, success: false });
+            expect((await factory.getConfig()).guaranteePercent).toBe(2n);
+        });
+
+        it('35: UpdateListingParams bounds guarantee 1..20 and commission 0..10', async () => {
+            const badG = await factory.send(dao.getSender(), { value: toNano('0.05') }, {
+                $$type: 'UpdateListingParams',
+                guaranteePercent: 21n, commissionPercent: 255n,
+                deadlineWindow: 0n, listingWindow: 0n,
+                objectionWindow: 0n, disputeTimeoutWindow: 0n, destroyGraceWindow: 0n,
+            });
+            expect(badG.transactions).toHaveTransaction({ from: dao.address, to: factory.address, success: false });
+
+            const badC = await factory.send(dao.getSender(), { value: toNano('0.05') }, {
+                $$type: 'UpdateListingParams',
+                guaranteePercent: 0n, commissionPercent: 11n,
+                deadlineWindow: 0n, listingWindow: 0n,
+                objectionWindow: 0n, disputeTimeoutWindow: 0n, destroyGraceWindow: 0n,
+            });
+            expect(badC.transactions).toHaveTransaction({ from: dao.address, to: factory.address, success: false });
+            expect((await factory.getConfig()).guaranteePercent).toBe(2n);
+        });
+
+        it('36: EvtListingDeployed carries the new fields and a uint64 initialSupply', async () => {
+            const big = 5_000_000_000n;   // > uint32 max
+            await createListing(seller, big, 1n, { minOrderQty: 10n, maxOrderQty: 0n });
+            const l = await openListing(1n);
+            expect(await l.getInitialSupply()).toBe(big);
+            expect(await l.getRemainingSupply()).toBe(big);
+            expect(await l.getMinOrderQty()).toBe(10n);
+        });
+
+        it('37: factory config() exposes the seven tunable params', async () => {
+            const cfg = await factory.getConfig();
+            expect(cfg.guaranteePercent).toBe(2n);
+            expect(cfg.commissionPercent).toBe(1n);
+            expect(cfg.deadlineWindow).toBe(2592000n);
+            expect(cfg.listingWindow).toBe(2592000n);
+            expect(cfg.objectionWindow).toBe(172800n);
+            expect(cfg.disputeTimeoutWindow).toBe(2592000n);
+            expect(cfg.destroyGraceWindow).toBe(3600n);
+        });
+
+        // ── Review fix L1: UpdateListingParams must clamp windows itself, not
+        // just leave it to the next CreateListing to discover via a bounce. ──
+        it('38: UpdateListingParams rejects an out-of-range window and leaves state unchanged', async () => {
+            const bad = await factory.send(dao.getSender(), { value: toNano('0.05') }, {
+                $$type: 'UpdateListingParams',
+                guaranteePercent: 0n, commissionPercent: 255n,
+                deadlineWindow: 0n, listingWindow: 0n,
+                objectionWindow: 10n, // below the 300s floor
+                disputeTimeoutWindow: 0n, destroyGraceWindow: 0n,
+            });
+            expect(bad.transactions).toHaveTransaction({ from: dao.address, to: factory.address, success: false });
+            expect((await factory.getConfig()).objectionWindow).toBe(172800n); // unchanged default
+
+            // A subsequent CreateListing is unaffected — proves the bad value never landed.
+            await createListing(seller, 10, 90n);
+            const l = await openListing(1n);
+            expect(await l.getListingObjectionWindow()).toBe(172800n);
+        });
+
+        it('39: UpdateListingParams accepts an in-range window and it flows to new listings', async () => {
+            await factory.send(dao.getSender(), { value: toNano('0.05') }, {
+                $$type: 'UpdateListingParams',
+                guaranteePercent: 0n, commissionPercent: 255n,
+                deadlineWindow: 0n, listingWindow: 0n,
+                objectionWindow: 3600n,
+                disputeTimeoutWindow: 0n, destroyGraceWindow: 0n,
+            });
+            expect((await factory.getConfig()).objectionWindow).toBe(3600n);
+            await createListing(seller, 10, 91n);
+            const l = await openListing(1n);
+            expect(await l.getListingObjectionWindow()).toBe(3600n);
+        });
+    });
+
+    // ── MK-N2 (factory half): a bounced listing deploy must release the seller's
+    // nonce, or the wallet's auto-retry of the identical signed form fails with
+    // "Duplicate listing submission" forever. ──
+    it('40: a bounced listing deploy releases the nonce so the same signed form can be retried', async () => {
+        const listingAddr = await factory.getListingAddress(1n);
+
+        // Drive CreateListing one step: the factory marks the nonce seen and fires
+        // the deploy+configure message, left in-flight via the paused iterator.
+        const body = beginCell().store(storeCreateListing({
+            $$type: 'CreateListing',
+            pricePerUnit: PRICE,
+            initialSupply: 3n,
+            minOrderQty: 0n,
+            maxOrderQty: 0n,
+            validationType: BigInt(VTYPE),
+            settlementMode: 0n,
+            agreementCID: null,
+            nonce: 1n,
+        })).endCell();
+        const relaxed = internal({ to: factory.address, value: toNano('4.3'), body, bounce: true });
+        const iter = await blockchain.sendMessageIter(
+            { info: { ...relaxed.info, src: seller.address }, body: relaxed.body } as any,
+            { allowParallel: true },
+        );
+        await iter.next();
+        expect(await factory.getTotalListings()).toBe(0n);   // deploy still in-flight, not acked
+
+        // While the first form is in-flight, an identical resubmission is rejected.
+        const dup = await createListing(seller, 3, 1n);
+        expect(dup.transactions).toHaveTransaction({ from: seller.address, to: factory.address, success: false });
+
+        // The deploy bounces back from the (never-initialized) listing address.
+        const bounceBody = beginCell().storeUint(0xFFFFFFFF, 32).storeUint(0x1001, 32).endCell();
+        const b = internal({ to: factory.address, value: toNano('0.3'), body: bounceBody, bounce: false });
+        const bounced = await blockchain.sendMessage({
+            info: { ...b.info, src: listingAddr, bounced: true },
+            body: b.body,
+        } as any);
+
+        // The seller was refunded and the nonce released: the identical form now succeeds.
+        expect(bounced.transactions).toHaveTransaction({ from: factory.address, to: seller.address, success: true });
+        const retry = await createListing(seller, 3, 1n);
+        expect(retry.transactions).toHaveTransaction({ from: seller.address, to: factory.address, success: true });
+        expect(await factory.getTotalListings()).toBe(1n);
+
+        // clean up the still-open iterator (the stale deploy lands harmlessly — its
+        // ListingConfigured ack no longer matches a pending entry and is rejected)
+        let r = await iter.next();
+        while (!r.done) r = await iter.next();
+        expect(await factory.getTotalListings()).toBe(1n);
     });
 });

@@ -62,6 +62,10 @@ message(0xd1735400) TakeWalletAddress {
     ownerAddress: Slice as remaining;     // Maybe ^MsgAddress — ignored
 }
 
+message(0xd53276db) JettonExcesses {
+    queryId: Int as uint64;
+}
+
 // ============================================================
 // Vault control messages (same op-codes as V1, minus Buyer/SellerDeposit
 // which are replaced by jetton notifications)
@@ -82,6 +86,10 @@ message(0x1001) InitVault {
     validationType: Int as uint8;       // report kind this vault accepts (0 = any)
     agreementCID: Cell?;                // IPFS CID of the signed terms (informational anchor)
     settlementMode: Int as uint8;       // 0 = oracle-only, 1 = manual-only (doc-hash)
+    // ── V3.1 Tier 2: dispute-timing windows seeded from the listing (0 => vault default) ──
+    objectionWindow: Int as uint32;      // post-report window for either party to dispute
+    disputeTimeoutWindow: Int as uint32; // dispute auto-timeout
+    destroyGraceWindow: Int as uint32;   // grace before a terminal vault self-destructs
 }
 
 // Authenticated report forwarded by OracleRegistry. Field layout MUST match the
@@ -224,11 +232,22 @@ contract EscrowOracleVault with Ownable {
     const StateCancelled: Int = 6;
     const StateExpired: Int = 7;
 
-    const MinTonForStorage: Int = ton("0.01");
-    const DisputeTimeoutWindow: Int = 2592000; // 30 days
+    // V3.1: these three timing windows are now SEEDED PER VAULT via InitVault
+    // (previously hard-coded consts here). The consts below are the protocol
+    // defaults the listing/factory fall back to when they pass 0. Runtime values
+    // live in self.disputeTimeoutWindow / self.destroyGraceWindow / self.objectionWindow.
+    const DefaultDisputeTimeoutWindow: Int = 2592000; // 30 days
+
+    // Grace window before a terminal vault self-destructs (M-1 companion fix,
+    // ported from EscrowJettonVault). A payout jetton transfer is sent with
+    // bounce:true and only confirmed later (JettonExcesses) or bounced back — so
+    // the vault must NOT vanish the instant claimables hit zero, or a bounce
+    // would land on a destroyed contract and strand the returning jettons. We
+    // defer the destroy for this long after first entering a terminal state.
+    const DefaultDestroyGraceWindow: Int = 3600; // 1 hour
 
     // === V3 oracle settlement ===
-    const ObjectionWindow: Int = 172800;   // 48h window after a Delivered/Failed report; EITHER party may dispute (buyer can release early)
+    const DefaultObjectionWindow: Int = 172800;   // 48h window after a Delivered/Failed report; EITHER party may dispute (buyer can release early)
     const OracleDelivered: Int = 0;
     const OracleFailed: Int = 1;
     const OraclePartial: Int = 2;
@@ -239,7 +258,9 @@ contract EscrowOracleVault with Ownable {
 
     // === Jetton gas constants ===
     // TON attached to an outbound jetton transfer (paid separately from balance).
-    const JettonFwdGas: Int = ton("0.05");
+    // 0.15 TON, matching EscrowJettonVault's post-audit value (~82x the worst
+    // observed jetton-wallet-deploy cost) — see V2_JETTON_ESCROW_DESIGN.md M-1.
+    const JettonFwdGas: Int = ton("0.15");
     // TON attached to the wallet-discovery request to the master.
     const WalletDiscoveryGas: Int = ton("0.05");
 
@@ -280,6 +301,45 @@ contract EscrowOracleVault with Ownable {
 
     disputeDeadline: Int as uint32;
 
+    // Timestamp of first entry into a terminal state; 0 until then. Starts the
+    // DestroyGraceWindow so _checkAllWithdrawn defers self-destruct while a
+    // payout may still bounce back. Written once (terminal states are never left).
+    terminalAt: Int as uint32;
+
+    // Pending jetton payout tracking (M-1 fix, ported from EscrowJettonVault):
+    // each Withdraw gets a unique queryId; bounced() restores claimable if the
+    // send fails, instead of irrecoverably zeroing it while the jettons return
+    // to our own wallet. See V2_JETTON_ESCROW_DESIGN.md M-1.
+    withdrawNonce: Int as uint64;
+    pendingPayoutType:   map<Int, Int as uint8>;    // qid → 1=buyer 2=seller 3=comm 4=refund
+
+    pendingPayoutAmount: map<Int, Int as coins>;    // qid → amount
+
+    // V3-L1 fix (V2-N2 ported): deposit refunds previously all shared
+    // queryId=0 with no pending-map entry, so a bounce (recipient frozen or
+    // destroyed between deposit and refund) returned to our own wallet with no
+    // claimable, no record, no recovery. Mirrors the milestone vault's
+    // failedPayout scheme: unique qid, accumulate on bounce, reclaim
+    // permissionlessly. Only used when pendingPayoutType[qid] == 4.
+    pendingRefundTo:   map<Int, Address>;
+    failedPayout:      map<Address, Int as coins>;
+    failedPayoutCount: Int as uint16;
+
+    // V2-N1 fix (ported — this vault had the same gap, just never separately
+    // flagged): counts payouts sent but not yet resolved. _checkAllWithdrawn
+    // must not destroy the vault in the SAME transaction that just queued a
+    // send whose outcome isn't known yet. Decremented by bounced(), which TVM
+    // itself authenticates — never by JettonExcesses: per TEP-74 that message
+    // is sent by the RECIPIENT's own jetton wallet (an arbitrary address we
+    // can't cheaply verify), so trusting it as confirmation would let a forger
+    // who guesses the next sequential queryId suppress a genuine later
+    // bounce-restore. Gated by lastPayoutAt below, not held open indefinitely —
+    // a real failure bounces back promptly, so there's nothing unbounded to
+    // wait for.
+    inFlightPayouts: Int as uint16;
+    // Timestamp of the most recent tracked send — see _checkAllWithdrawn.
+    lastPayoutAt: Int as uint32;
+
     // === V2: jetton asset + discovered wallet ===
     jettonMaster:   Address;
     myJettonWallet: Address;
@@ -292,6 +352,10 @@ contract EscrowOracleVault with Ownable {
     settlementMode:    Int as uint8;    // SettleModeOracle | SettleModeManual (seeded by the listing)
     objectionDeadline: Int as uint32;   // 0 until a Delivered/Failed report opens the window
     reportedStatus:    Int as uint8;    // the pending report's status, valid while objectionDeadline != 0
+    // V3.1 Tier 2: per-vault timing windows (seeded by InitVault; see Default* consts)
+    objectionWindow:      Int as uint32;
+    disputeTimeoutWindow: Int as uint32;
+    destroyGraceWindow:   Int as uint32;
 
     init(factory: Address, dao: Address, seqno: Int) {
         self.owner = dao;
@@ -328,6 +392,11 @@ contract EscrowOracleVault with Ownable {
         self.settleProposer = dao;
 
         self.disputeDeadline = 0;
+        self.terminalAt      = 0;
+        self.withdrawNonce   = 0;
+        self.failedPayoutCount = 0;
+        self.inFlightPayouts   = 0;
+        self.lastPayoutAt      = 0;
 
         self.jettonMaster   = dao;   // placeholder; set by InitVault
         self.myJettonWallet = dao;   // placeholder; set by TakeWalletAddress
@@ -339,17 +408,37 @@ contract EscrowOracleVault with Ownable {
         self.settlementMode    = 0;
         self.objectionDeadline = 0;
         self.reportedStatus    = 0;
+        self.objectionWindow      = self.DefaultObjectionWindow;      // placeholder; set by InitVault
+        self.disputeTimeoutWindow = self.DefaultDisputeTimeoutWindow;
+        self.destroyGraceWindow   = self.DefaultDestroyGraceWindow;
     }
 
     // ========================================
     // InitVault — from factory, once. Also kicks off jetton-wallet discovery.
     // ========================================
 
+    // Gas top-up (rescue): permissionless, accept a plain empty-body TON transfer
+    // so anyone can refill the vault's gas if the fixed deployment budget is ever
+    // exhausted (e.g. repeated wrong-sender deposit refunds, each costing
+    // JettonFwdGas). Without this, a depleted vault could fail a payout send
+    // after state already advanced, stranding jettons with no recovery path.
+    // Mirrors EscrowJettonVault's identical rescue receiver.
+    receive() {}
+
     receive(msg: InitVault) {
         require(sender() == self.factory, "Only factory can initialize");
         require(self.state == self.StateCreated, "Already initialized");
         require(msg.tradeValue > 0, "Trade value must be positive");
         require(msg.buyer != msg.seller, "Buyer and seller must differ");
+        // Neither trade party may be the commissionaires DAO. Withdraw resolves a
+        // caller by identity (buyer branch first); if a party collided with the
+        // commissionaires address its commission claimable could never be pulled,
+        // stranding the jettons and blocking self-destruct. (V2 audit L-3.)
+        require(msg.buyer != msg.commissionairesDao && msg.seller != msg.commissionairesDao, "Trade party cannot be commissionaires DAO");
+        // V3-L3: self.owner is the arbitrator (dao), baked in at deploy from the
+        // listing's ConfigureListing. Fail-closed here too, in case a listing from
+        // before that guard existed (or a non-marketplace caller) ever reaches this.
+        require(msg.buyer != self.owner && msg.seller != self.owner, "Trade party cannot be the arbitrator");
         require(msg.guaranteePercent > 0 && msg.guaranteePercent <= 20, "Guarantee % must be 1-20");
         require(msg.commissionPercent <= 10, "Commission cannot exceed 10%");
         require(msg.deadline > now(), "Deadline must be in the future");
@@ -369,8 +458,22 @@ contract EscrowOracleVault with Ownable {
         self.agreementCID   = msg.agreementCID;
         self.settlementMode = msg.settlementMode;
 
+        // V3.1 Tier 2: adopt the listing's dispute-timing windows. 0 => keep the
+        // protocol default; clamp to a 5-minute..1-year band as a safety net
+        // (the listing already validates, but a vault may be init'd directly in tests).
+        self.objectionWindow      = self._windowOr(msg.objectionWindow,      self.DefaultObjectionWindow);
+        self.disputeTimeoutWindow = self._windowOr(msg.disputeTimeoutWindow, self.DefaultDisputeTimeoutWindow);
+        self.destroyGraceWindow   = self._windowOr(msg.destroyGraceWindow,   self.DefaultDestroyGraceWindow);
+
         self.buyerDepositAmount = msg.tradeValue;
         self.sellerDepositAmount = msg.tradeValue * msg.guaranteePercent / 100;
+        // V3-L2 / MK-N3: integer division floors sellerDepositAmount to 0 for a
+        // small enough tradeValue (e.g. < 100 at 2%). A zero requirement means
+        // DepositBond's "already bonded" gate is the only thing standing between
+        // the trade and activating with no seller collateral at all — reject it
+        // here instead; the bounce this throw causes lets the listing/factory
+        // refund the buyer cleanly through their existing bounced() handlers.
+        require(self.sellerDepositAmount > 0, "Trade value too small for a non-zero guarantee deposit");
         self.deadline = msg.deadline;
 
         self.state = self.StateAwaitingDeposits;
@@ -417,29 +520,29 @@ contract EscrowOracleVault with Ownable {
 
         // Wrong phase → refund the whole amount.
         if (self.state != self.StateAwaitingDeposits) {
-            self._sendJettons(from, amt);
+            self._refundDeposit(from, amt);
             return;
         }
 
         if (from == self.buyer) {
-            if (self.buyerDeposited) { self._sendJettons(from, amt); return; }
+            if (self.buyerDeposited) { self._refundDeposit(from, amt); return; }
             let required: Int = self.buyerDepositAmount;
-            if (amt < required) { self._sendJettons(from, amt); return; }
-            if (amt > required) { self._sendJettons(from, amt - required); }
+            if (amt < required) { self._refundDeposit(from, amt); return; }
+            if (amt > required) { self._refundDeposit(from, amt - required); }
             self.buyerDeposited = true;
             emit(EvtDeposit{ tradeId: self.tradeId, depositor: self.buyer, amount: required, isBuyer: true }.toCell());
             self._checkBothDeposited();
         } else if (from == self.seller) {
-            if (self.sellerDeposited) { self._sendJettons(from, amt); return; }
+            if (self.sellerDeposited) { self._refundDeposit(from, amt); return; }
             let required: Int = self.sellerDepositAmount;
-            if (amt < required) { self._sendJettons(from, amt); return; }
-            if (amt > required) { self._sendJettons(from, amt - required); }
+            if (amt < required) { self._refundDeposit(from, amt); return; }
+            if (amt > required) { self._refundDeposit(from, amt - required); }
             self.sellerDeposited = true;
             emit(EvtDeposit{ tradeId: self.tradeId, depositor: self.seller, amount: required, isBuyer: false }.toCell());
             self._checkBothDeposited();
         } else {
             // Not a trade party → refund.
-            self._sendJettons(from, amt);
+            self._refundDeposit(from, amt);
         }
     }
 
@@ -473,7 +576,12 @@ contract EscrowOracleVault with Ownable {
     }
 
     // ========================================
-    // RaiseDispute — identical to V1
+    // RaiseDispute — V1 logic identical; V3 additionally clears any pending
+    // oracle report so a stale objectionDeadline/reportedStatus never lingers
+    // into StateDisputed/StateResolved. Not fund-safety-critical on its own —
+    // OracleReport and FinalizeDelivery both independently require
+    // state == StateAwaitingConfirmation, which a disputed vault never returns
+    // to — but leaves the getters accurate for off-chain readers.
     // ========================================
 
     receive(msg: RaiseDispute) {
@@ -484,7 +592,9 @@ contract EscrowOracleVault with Ownable {
             self.state == self.StateExpired,
             "Not in disputable state"
         );
-        self.disputeDeadline = now() + self.DisputeTimeoutWindow;
+        self.objectionDeadline = 0;
+        self.reportedStatus = 0;
+        self.disputeDeadline = now() + self.disputeTimeoutWindow;
         self._changeState(self.StateDisputed);
     }
 
@@ -563,24 +673,92 @@ contract EscrowOracleVault with Ownable {
         );
 
         let claimable: Int = 0;
+        let partyType: Int = 0;   // 1=buyer 2=seller 3=commissionaires
 
         if (s == self.buyer) {
             claimable = self.buyerClaimable;
-            self.buyerClaimable = 0;
+            partyType = 1;
         } else if (s == self.seller) {
             claimable = self.sellerClaimable;
-            self.sellerClaimable = 0;
+            partyType = 2;
         } else if (s == self.commissionairesDao) {
             claimable = self.commissionairesClaimable;
-            self.commissionairesClaimable = 0;
+            partyType = 3;
         } else {
             require(false, "Not authorized to withdraw");
         }
 
         require(claimable > 0, "Nothing to withdraw");
 
-        self._sendJettons(s, claimable);
+        // M-1 fix: record payout BEFORE zeroing claimable. If the jetton send
+        // bounces (wallet temporarily unavailable), bounced() restores the
+        // claimable so the party can retry. Without this the claimable is
+        // irrecoverably zeroed while the jettons return to our wallet.
+        self.withdrawNonce = self.withdrawNonce + 1;
+        let qid: Int = self.withdrawNonce;
+        self.pendingPayoutType.set(qid, partyType);
+        self.pendingPayoutAmount.set(qid, claimable);
+        self.inFlightPayouts = self.inFlightPayouts + 1; // V2-N1 (ported)
+
+        if (partyType == 1)      { self.buyerClaimable           = 0; }
+        else if (partyType == 2) { self.sellerClaimable          = 0; }
+        else                     { self.commissionairesClaimable = 0; }
+
+        self._sendJettons(s, claimable, qid);
         self._checkAllWithdrawn();
+    }
+
+    // Restore claimable if the jetton wallet bounces our payout transfer.
+    bounced(msg: bounced<JettonTransfer>) {
+        let qid: Int = msg.queryId;
+        if (!self.pendingPayoutType.exists(qid)) { return; }
+        let partyType: Int = self.pendingPayoutType.get(qid)!!;
+        let amt: Int = self.pendingPayoutAmount.get(qid)!!;
+        self.pendingPayoutType.del(qid);
+        self.pendingPayoutAmount.del(qid);
+        self.inFlightPayouts = self.inFlightPayouts - 1; // V2-N1 (ported)
+        if (partyType == 1)      { self.buyerClaimable           = self.buyerClaimable           + amt; }
+        else if (partyType == 2) { self.sellerClaimable          = self.sellerClaimable          + amt; }
+        else if (partyType == 3) { self.commissionairesClaimable = self.commissionairesClaimable + amt; }
+        else {
+            // V3-L1: a bounced deposit refund — the recipient isn't necessarily a
+            // trade party, so there's no claimable bucket to restore into.
+            // Accumulate for permissionless reclaim instead.
+            let to: Address = self.pendingRefundTo.get(qid)!!;
+            self.pendingRefundTo.del(qid);
+            let prior: Int = 0;
+            let isNewEntry: Bool = !self.failedPayout.exists(to);
+            if (!isNewEntry) { prior = self.failedPayout.get(to)!!; }
+            self.failedPayout.set(to, prior + amt);
+            if (isNewEntry) { self.failedPayoutCount = self.failedPayoutCount + 1; }
+        }
+    }
+
+    // Best-effort cleanup only — NOT relied on for correctness. Per TEP-74,
+    // `excesses` is sent by the RECIPIENT's own jetton wallet, not
+    // self.myJettonWallet, so the check below means this in practice only
+    // matches the narrow case where that happens to coincide. Real resolution
+    // is time-based (lastPayoutAt, see _checkAllWithdrawn) plus bounced().
+    receive(msg: JettonExcesses) {
+        if (sender() != self.myJettonWallet) { return; }
+        if (!self.pendingPayoutType.exists(msg.queryId)) { return; }
+        if (self.pendingPayoutType.get(msg.queryId)!! == 4) {
+            self.pendingRefundTo.del(msg.queryId);
+        }
+        self.pendingPayoutType.del(msg.queryId);
+        self.pendingPayoutAmount.del(msg.queryId);
+        self.inFlightPayouts = self.inFlightPayouts - 1; // V2-N1 (ported)
+        self._checkAllWithdrawn();
+    }
+
+    // V3-L1: permissionless retry for a recipient whose deposit refund bounced.
+    receive("ClaimFailedPayout") {
+        let s: Address = sender();
+        require(self.failedPayout.exists(s) && self.failedPayout.get(s)!! > 0, "No failed payout to claim");
+        let amt: Int = self.failedPayout.get(s)!!;
+        self.failedPayout.del(s);
+        self.failedPayoutCount = self.failedPayoutCount - 1;
+        self._refundDeposit(s, amt);
     }
 
     // ========================================
@@ -663,9 +841,23 @@ contract EscrowOracleVault with Ownable {
         require(self.deadline > 0,                             "No deadline set for this vault");
         require(now() > self.deadline,                         "Deadline has not passed yet");
         require(!self.sellerConfirmed,                         "Seller already confirmed");
+        // A pending oracle report (Delivered/Failed window open) must NOT be
+        // voidable by expiry: in oracle mode sellerConfirmed can never be true,
+        // so without this guard anyone could expire a delivered trade and let the
+        // buyer reclaim full payment via CancelTrade. Once a window is open the
+        // trade settles through FinalizeDelivery (or a dispute), never expiry.
+        require(self.objectionDeadline == 0,                   "Oracle report pending — finalize or dispute instead");
 
         self._changeState(self.StateExpired);
         emit(EvtDeadlinePassed{ tradeId: self.tradeId }.toCell());
+    }
+
+    // Permissionless: perform the destroy that _checkAllWithdrawn deferred during
+    // the grace window, reclaiming the vault's leftover gas. Anyone may call it —
+    // it only acts in a terminal state with every claimable already at zero, so
+    // it grants no privilege and can take nothing from anyone. Too-early = no-op.
+    receive("Reap") {
+        self._checkAllWithdrawn();
     }
 
     receive(msg: RaiseDisputeWithClaim) {
@@ -679,7 +871,7 @@ contract EscrowOracleVault with Ownable {
         require(msg.docHash != 0,                              "Doc hash evidence required");
 
         self.disputeDocHash = msg.docHash;
-        self.disputeDeadline = now() + self.DisputeTimeoutWindow;
+        self.disputeDeadline = now() + self.disputeTimeoutWindow;
         self._changeState(self.StateDisputed);
     }
 
@@ -720,21 +912,23 @@ contract EscrowOracleVault with Ownable {
         require(self.state == self.StateAwaitingConfirmation,  "Not in confirmation state");
         require(self.objectionDeadline == 0,                   "An oracle report is already pending");
         require(msg.tradeId == self.tradeId,                   "Wrong trade");
-        require(msg.validationType == self.validationType,     "Validation type mismatch");
+        // validationType 0 = accept any report kind (the documented wildcard);
+        // otherwise the report kind must match exactly.
+        require(self.validationType == 0 || msg.validationType == self.validationType, "Validation type mismatch");
         require(self.deadline == 0 || now() <= self.deadline,  "Deadline has passed — call CheckExpiry first");
 
         if (msg.status == self.OraclePartial) {
             // Oracle itself reports a contested outcome → straight to dispute.
-            self.disputeDeadline = now() + self.DisputeTimeoutWindow;
+            self.disputeDeadline = now() + self.disputeTimeoutWindow;
             self._changeState(self.StateDisputed);
             emit(EvtOracleReport{ tradeId: self.tradeId, status: self.OraclePartial, objectionDeadline: 0 }.toCell());
         } else {
-            // Delivered OR Failed → open a 72h objection window. EITHER party may
+            // Delivered OR Failed → open a 48h objection window. EITHER party may
             // RaiseDispute before it elapses; otherwise anyone may FinalizeDelivery
             // to apply the reported outcome. Fund movement is never unilateral.
             require(msg.status == self.OracleDelivered || msg.status == self.OracleFailed, "Unknown status");
             self.reportedStatus    = msg.status;
-            self.objectionDeadline = now() + self.ObjectionWindow;
+            self.objectionDeadline = now() + self.objectionWindow;
             emit(EvtOracleReport{ tradeId: self.tradeId, status: msg.status, objectionDeadline: self.objectionDeadline }.toCell());
         }
     }
@@ -769,9 +963,13 @@ contract EscrowOracleVault with Ownable {
     // Buyer confirms receipt and releases funds to the seller immediately, waiving
     // any remaining objection window. Buyer-only + can only pay the seller, so it's
     // always safe and available in either settlement mode / with or without a report.
+    // Also clears any pending oracle report (same getter-hygiene reasoning as
+    // RaiseDispute above) so a stale objectionDeadline never lingers into StateSuccessful.
     receive(msg: BuyerAcceptDelivery) {
         require(sender() == self.buyer,                        "Only the buyer can release funds");
         require(self.state == self.StateAwaitingConfirmation,  "Only from the active/confirmation state");
+        self.objectionDeadline = 0;
+        self.reportedStatus    = 0;
         self._allocateOnSuccess();
     }
 
@@ -780,6 +978,15 @@ contract EscrowOracleVault with Ownable {
     // ========================================
 
     // Allocate the pool to seller + commission on a successful two-phase confirm.
+    // V3.1: resolve a seeded timing window — 0 means "use the protocol default" —
+    // and clamp it to a 5-minute..1-year band.
+    fun _windowOr(value: Int, fallback: Int): Int {
+        let v: Int = value;
+        if (v == 0) { v = fallback; }
+        require(v >= 300 && v <= 31536000, "Window out of range (5m..1y)");
+        return v;
+    }
+
     fun _allocateOnSuccess() {
         let totalPool: Int        = self.buyerDepositAmount + self.sellerDepositAmount;
         let commissionAmount: Int = self.tradeValue * self.commissionPercent / 100;
@@ -800,16 +1007,20 @@ contract EscrowOracleVault with Ownable {
 
     // Send `amount` jettons to `to` through our own jetton wallet.
     // forwardPayload carries the single Either=0 bit so standard wallets parse
-    // an empty inline payload without throwing.
-    fun _sendJettons(to: Address, amount: Int) {
+    // an empty inline payload without throwing. bounce: true + a queryId lets
+    // bounced() restore claimable on failure (M-1 fix). Deposit refunds route
+    // through _refundDeposit below, which allocates a real tracked queryId
+    // instead of the old hardcoded 0 (V3-L1).
+    fun _sendJettons(to: Address, amount: Int, queryId: Int) {
         if (amount <= 0) { return; }
+        self.lastPayoutAt = now();
         send(SendParameters{
             to:     self.myJettonWallet,
             value:  self.JettonFwdGas,
             mode:   SendPayGasSeparately,
-            bounce: false,
+            bounce: true,
             body:   JettonTransfer{
-                queryId:             0,
+                queryId:             queryId,
                 amount:              amount,
                 destination:         to,
                 responseDestination: myAddress(),   // recoup leftover gas to the vault
@@ -818,6 +1029,20 @@ contract EscrowOracleVault with Ownable {
                 forwardPayload:      beginCell().storeUint(0, 1).endCell().asSlice()
             }.toCell()
         });
+    }
+
+    // V3-L1: refund a deposit through the same tracked, bounce-recoverable
+    // path as a Withdraw payout, instead of the untracked queryId=0 sends this
+    // replaces.
+    fun _refundDeposit(to: Address, amount: Int) {
+        if (amount <= 0) { return; }
+        self.withdrawNonce = self.withdrawNonce + 1;
+        let qid: Int = self.withdrawNonce;
+        self.pendingPayoutType.set(qid, 4); // 4 = refund
+        self.pendingRefundTo.set(qid, to);
+        self.pendingPayoutAmount.set(qid, amount);
+        self.inFlightPayouts = self.inFlightPayouts + 1;
+        self._sendJettons(to, amount, qid);
     }
 
     fun _requestJettonWallet() {
@@ -853,6 +1078,20 @@ contract EscrowOracleVault with Ownable {
         if (self.buyerClaimable          == 0 &&
             self.sellerClaimable         == 0 &&
             self.commissionairesClaimable == 0) {
+            // V2-N1 (ported): never destroy in the same transaction that just
+            // queued a payout send. Bounded by lastPayoutAt rather than held
+            // open indefinitely — a real failure bounces back promptly, so once
+            // destroyGraceWindow has passed since the last send with no bounce,
+            // it's safe to treat it as settled (see the JettonExcesses receiver).
+            if (self.inFlightPayouts > 0 && now() < self.lastPayoutAt + self.destroyGraceWindow) { return; }
+            // V3-L1: unlike inFlightPayouts, this stays an indefinite gate — a
+            // bounce already confirmed via bounced() that this money is owed;
+            // only ClaimFailedPayout should ever release it.
+            if (self.failedPayoutCount > 0) { return; }
+            if (self.terminalAt != 0 && now() < self.terminalAt + self.destroyGraceWindow) {
+                return; // still inside the grace window — a bounced payout may
+                        // yet return and need its claimable restored via bounced().
+            }
             send(SendParameters{
                 to:    self.buyer,
                 value: 0,
@@ -865,6 +1104,14 @@ contract EscrowOracleVault with Ownable {
     fun _changeState(newState: Int) {
         let oldState: Int = self.state;
         self.state = newState;
+        // Stamp the first entry into a terminal state — starts the destroy grace
+        // window. Terminal states are never left, so this is written once.
+        if (self.terminalAt == 0 && (
+                newState == self.StateSuccessful ||
+                newState == self.StateResolved   ||
+                newState == self.StateCancelled)) {
+            self.terminalAt = now();
+        }
         emit(EvtStateChanged{
             tradeId: self.tradeId,
             oldState: oldState,
@@ -920,4 +1167,7 @@ contract EscrowOracleVault with Ownable {
     get fun objectionDeadline(): Int      { return self.objectionDeadline; }
     get fun reportedStatus(): Int         { return self.reportedStatus; }
     get fun agreementCID(): Cell?         { return self.agreementCID; }
+    get fun objectionWindow(): Int        { return self.objectionWindow; }        // V3.1
+    get fun disputeTimeoutWindow(): Int   { return self.disputeTimeoutWindow; }   // V3.1
+    get fun destroyGraceWindow(): Int     { return self.destroyGraceWindow; }     // V3.1
 }

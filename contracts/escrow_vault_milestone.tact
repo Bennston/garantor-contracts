@@ -89,6 +89,16 @@ contract EscrowVaultMilestone with Deployable {
     // settling (ProposeMilestoneSettlement) or letting the council resolve (24-48h).
     const PreActivationTimeoutWindow: Int = 604800; // 7 days
 
+    // Every payout site below requires the vault to hold this much beyond the
+    // payout itself before it is allowed to run. TON's action-phase sends do not
+    // roll back compute-phase state on failure (SendPayGasSeparately/bounce:false
+    // included) — a mid-payout balance shortfall would otherwise strand or misroute
+    // funds while state (milestone/vault status) had already advanced. Requiring
+    // the float up front turns that into a plain revert: nothing changes, and the
+    // action can be retried once the vault is topped up (see the fallback receive
+    // below).
+    const GasReserve: Int = ton("0.1");
+
     // Factory that deployed this vault (only factory can call InitMilestoneVault)
     factory:            Address;
     tradeId:            Int as uint64;
@@ -200,6 +210,11 @@ contract EscrowVaultMilestone with Deployable {
         self.m1SettleProposer   = newAddress(0, 0);
     }
 
+    // Plain top-ups (no body) are accepted so a vault that reverts a payout for
+    // lack of balance (the GasReserve guards below) can be rescued by anyone
+    // sending it more TON, then retrying the same action.
+    receive() { }
+
     // ─── Factory funds and configures the vault ────────────────────────────────
     receive(msg: InitMilestoneVault) {
         require(sender() == self.factory,                "Only factory can init");
@@ -257,6 +272,10 @@ contract EscrowVaultMilestone with Deployable {
         require(self.vaultState == 0,                     "Wrong vault state");
         require(self.totalValue > 0,                      "Vault not initialised");
         require(!self.sellerBonded,                       "Bond already deposited");
+        // V1-6: without this, a deposit landing after RefundPreActivationStall's
+        // timeout has passed can race its destroy — reverting here (value returns
+        // via bounce) instead of racing keeps the two paths mutually exclusive.
+        require(now() <= self.createdAt + self.PreActivationTimeoutWindow, "Pre-activation window elapsed");
 
         let msgValue: Int = context().value;
         require(msgValue >= self.performanceBond,         "Insufficient bond amount");
@@ -285,6 +304,8 @@ contract EscrowVaultMilestone with Deployable {
         require(self.vaultState == 0,                "Wrong vault state");
         require(self.totalValue > 0,                 "Vault not initialised");
         require(!self.buyerFunded,                   "Payment already deposited");
+        // V1-6: see the matching guard in DepositBond above.
+        require(now() <= self.createdAt + self.PreActivationTimeoutWindow, "Pre-activation window elapsed");
 
         let msgValue: Int = context().value;
         let required: Int = self.totalValue + self.referrerFee;
@@ -334,6 +355,9 @@ contract EscrowVaultMilestone with Deployable {
         // No "nothing funded" gate: a vault that never received a single deposit
         // (e.g. both parties abandoned it) is exactly the case this must still be
         // able to close out and sweep its stranded gas — not a case to revert on.
+
+        require(myBalance() >= buyerRefund + sellerRefund + self.GasReserve,
+            "Insufficient vault balance for pre-activation refund");
 
         self.vaultState = 2; // CLOSED
 
@@ -399,6 +423,7 @@ contract EscrowVaultMilestone with Deployable {
     receive(msg: BuyerConfirmMilestone) {
         require(sender() == self.buyer,    "Only buyer");
         require(self.vaultState == 1,      "Vault not active");
+        require(msg.index <= 1,            "Invalid milestone index");
 
         if (msg.index == 0) {
             require(self.m0State == 1,     "M0 not in confirming state");
@@ -441,6 +466,7 @@ contract EscrowVaultMilestone with Deployable {
     receive(msg: BuyerDisputeMilestone) {
         require(sender() == self.buyer,    "Only buyer");
         require(self.vaultState == 1,      "Vault not active");
+        require(msg.index <= 1,            "Invalid milestone index");
 
         if (msg.index == 0) {
             require(self.m0State == 1,     "M0 not in confirming state");
@@ -463,10 +489,26 @@ contract EscrowVaultMilestone with Deployable {
         require(self.vaultState == 1,   "Vault not active");
         require(msg.index <= 1,         "Invalid milestone index");
 
+        // Tracks what this call has already committed to send, so the shared
+        // checkVaultClose() below (a possible further, fixed-value bond send)
+        // checks against the true combined total rather than re-reading the same
+        // unchanged myBalance() as if nothing had been queued yet.
+        let reserved: Int = 0;
+
         if (msg.index == 0) {
             require(self.m0State == 0,              "M0 is not pending");
             require(self.m0DeliveryDeadline > 0,    "Delivery deadline not set");
             require(now() > self.m0DeliveryDeadline,"Delivery deadline not yet passed");
+
+            // Slash M0's proportional share of the bond to buyer — seller abandoned
+            // this obligation but may still deliver M1, which keeps its own share as
+            // collateral. Mirrors ArbitratorResolveMilestone's slash math.
+            let m0BondSlash: Int = 0;
+            if (self.performanceBond > 0) {
+                m0BondSlash = self.performanceBond * self.m0Value / self.totalValue;
+            }
+            require(myBalance() >= self.m0Value + m0BondSlash + self.GasReserve,
+                "Insufficient vault balance to claim M0 abandoned");
 
             self.m0State = 2; // DONE (refunded)
             send(SendParameters{
@@ -475,21 +517,16 @@ contract EscrowVaultMilestone with Deployable {
                 mode:  SendPayGasSeparately,
                 bounce: false
             });
-            // Slash M0's proportional share of the bond to buyer — seller abandoned
-            // this obligation but may still deliver M1, which keeps its own share as
-            // collateral. Mirrors ArbitratorResolveMilestone's slash math.
-            if (self.performanceBond > 0) {
-                let m0BondSlash: Int = self.performanceBond * self.m0Value / self.totalValue;
-                if (m0BondSlash > 0) {
-                    send(SendParameters{
-                        to:    self.buyer,
-                        value: m0BondSlash,
-                        mode:  SendPayGasSeparately,
-                        bounce: false
-                    });
-                }
-                self.performanceBond = self.performanceBond - m0BondSlash;
+            if (m0BondSlash > 0) {
+                send(SendParameters{
+                    to:    self.buyer,
+                    value: m0BondSlash,
+                    mode:  SendPayGasSeparately,
+                    bounce: false
+                });
             }
+            self.performanceBond = self.performanceBond - m0BondSlash;
+            reserved = self.m0Value + m0BondSlash;
             // Allow M1 to be attempted (or claimed abandoned too)
             self.activeMilestone    = 1;
             self.m1DeliveryDeadline = now() + self.m1DeliveryWindow;
@@ -499,6 +536,9 @@ contract EscrowVaultMilestone with Deployable {
             require(self.m1DeliveryDeadline > 0,    "Delivery deadline not set");
             require(now() > self.m1DeliveryDeadline,"Delivery deadline not yet passed");
 
+            require(myBalance() >= self.m1Value + self.performanceBond + self.GasReserve,
+                "Insufficient vault balance to claim M1 abandoned");
+
             self.m1State = 2; // DONE (refunded)
             send(SendParameters{
                 to:    self.buyer,
@@ -506,6 +546,7 @@ contract EscrowVaultMilestone with Deployable {
                 mode:  SendPayGasSeparately,
                 bounce: false
             });
+            reserved = self.m1Value + self.performanceBond;
             // Slash any remaining bond to buyer
             if (self.performanceBond > 0) {
                 send(SendParameters{
@@ -518,7 +559,7 @@ contract EscrowVaultMilestone with Deployable {
             }
         }
 
-        self.checkVaultClose();
+        self.checkVaultClose(reserved);
     }
 
     // ─── Mutual cancel milestone (force majeure / bilateral agreement) ─────────
@@ -550,6 +591,9 @@ contract EscrowVaultMilestone with Deployable {
             else                  { self.m0CancelSeller = !self.m0CancelSeller; }
 
             if (self.m0CancelBuyer && self.m0CancelSeller) {
+                require(myBalance() >= self.m0Value + self.GasReserve,
+                    "Insufficient vault balance for M0 mutual cancel refund");
+
                 self.m0State = 2; // DONE — mutual cancel
                 send(SendParameters{
                     to:     self.buyer,
@@ -563,7 +607,7 @@ contract EscrowVaultMilestone with Deployable {
                     self.activeMilestone    = 1;
                     self.m1DeliveryDeadline = now() + self.m1DeliveryWindow;
                 }
-                self.checkVaultClose();
+                self.checkVaultClose(self.m0Value);
             }
         } else {
             require(self.m1State == 0 || self.m1State == 1, "M1 not in cancellable state");
@@ -571,6 +615,9 @@ contract EscrowVaultMilestone with Deployable {
             else                  { self.m1CancelSeller = !self.m1CancelSeller; }
 
             if (self.m1CancelBuyer && self.m1CancelSeller) {
+                require(myBalance() >= self.m1Value + self.GasReserve,
+                    "Insufficient vault balance for M1 mutual cancel refund");
+
                 self.m1State = 2; // DONE — mutual cancel
                 send(SendParameters{
                     to:     self.buyer,
@@ -579,7 +626,7 @@ contract EscrowVaultMilestone with Deployable {
                     bounce: false,
                     body:   "Mutual cancel: M1 refund".asComment()
                 });
-                self.checkVaultClose();
+                self.checkVaultClose(self.m1Value);
             }
         }
     }
@@ -626,9 +673,34 @@ contract EscrowVaultMilestone with Deployable {
     receive(msg: ArbitratorResolveMilestone) {
         require(sender() == self.arbitrator, "Only arbitrator");
         require(self.vaultState == 1,        "Vault not active");
+        require(msg.index <= 1,              "Invalid milestone index");
+
+        // Tracks this whole call's fixed-value outbound total (milestone payout +
+        // arbitrator fee + referrer/bond slash as applicable), so the shared
+        // checkVaultClose() at the end checks the true combined total against the
+        // one static myBalance() reading instead of re-approving funds this same
+        // transaction already committed.
+        let totalOutbound: Int = 0;
 
         if (msg.index == 0) {
             require(self.m0State == 3,       "M0 not in disputed state");
+
+            // Compute this branch's own outbound total up front and require the
+            // float survive it *before* any state changes, so a shortfall reverts
+            // the whole message instead of advancing m0State with a payout unsent.
+            let m0BondSlash: Int = 0;
+            totalOutbound = self.m0Value + self.arbitratorFee;
+            if (msg.releaseToSeller) {
+                if (!self.referrerPaid && self.referrerFee > 0) {
+                    totalOutbound = totalOutbound + self.referrerFee;
+                }
+            } else if (self.performanceBond > 0) {
+                m0BondSlash = self.performanceBond * self.m0Value / self.totalValue;
+                totalOutbound = totalOutbound + m0BondSlash;
+            }
+            require(myBalance() >= totalOutbound + self.GasReserve,
+                "Insufficient vault balance to resolve M0 dispute");
+
             self.m0State = 2; // DONE
             self.m0DisputeDeadline = 0;
 
@@ -651,18 +723,15 @@ contract EscrowVaultMilestone with Deployable {
                     mode:  SendPayGasSeparately,
                     bounce: false
                 });
-                if (self.performanceBond > 0) {
-                    let m0BondSlash: Int = self.performanceBond * self.m0Value / self.totalValue;
-                    if (m0BondSlash > 0) {
-                        send(SendParameters{
-                            to:    self.buyer,
-                            value: m0BondSlash,
-                            mode:  SendPayGasSeparately,
-                            bounce: false
-                        });
-                    }
-                    self.performanceBond = self.performanceBond - m0BondSlash;
+                if (m0BondSlash > 0) {
+                    send(SendParameters{
+                        to:    self.buyer,
+                        value: m0BondSlash,
+                        mode:  SendPayGasSeparately,
+                        bounce: false
+                    });
                 }
+                self.performanceBond = self.performanceBond - m0BondSlash;
             }
             // M1 delivery starts only after the M0 dispute is actually resolved.
             if (self.m1State == 0 && self.m1DeliveryDeadline == 0) {
@@ -671,6 +740,18 @@ contract EscrowVaultMilestone with Deployable {
 
         } else {
             require(self.m1State == 3,       "M1 not in disputed state");
+
+            totalOutbound = self.m1Value + self.arbitratorFee;
+            if (msg.releaseToSeller) {
+                if (!self.referrerPaid && self.referrerFee > 0) {
+                    totalOutbound = totalOutbound + self.referrerFee;
+                }
+            } else {
+                totalOutbound = totalOutbound + self.performanceBond;
+            }
+            require(myBalance() >= totalOutbound + self.GasReserve,
+                "Insufficient vault balance to resolve M1 dispute");
+
             self.m1State = 2; // DONE
             self.m1DisputeDeadline = 0;
 
@@ -716,7 +797,7 @@ contract EscrowVaultMilestone with Deployable {
             });
         }
 
-        self.checkVaultClose();
+        self.checkVaultClose(totalOutbound);
     }
 
     // ─── Internal: activate vault when both parties funded ────────────────────
@@ -728,6 +809,13 @@ contract EscrowVaultMilestone with Deployable {
 
     // ─── Internal: release milestone 0 ────────────────────────────────────────
     fun releaseMilestone0() {
+        let outbound: Int = self.m0Value;
+        if (!self.referrerPaid && self.referrerFee > 0) {
+            outbound = outbound + self.referrerFee;
+        }
+        require(myBalance() >= outbound + self.GasReserve,
+            "Insufficient vault balance to release milestone 0");
+
         send(SendParameters{
             to:    self.seller,
             value: self.m0Value,
@@ -737,13 +825,20 @@ contract EscrowVaultMilestone with Deployable {
         self.payReferrer();
         self.activeMilestone    = 1;
         self.m1DeliveryDeadline = now() + self.m1DeliveryWindow;
-        self.checkVaultClose();
+        self.checkVaultClose(outbound);
     }
 
     // ─── Internal: release milestone 1 ────────────────────────────────────────
     // Bond is NOT returned here — it is handled in checkVaultClose so that
     // it is never double-spent when M0 is disputed while M1 completes.
     fun releaseMilestone1() {
+        let outbound: Int = self.m1Value;
+        if (!self.referrerPaid && self.referrerFee > 0) {
+            outbound = outbound + self.referrerFee;
+        }
+        require(myBalance() >= outbound + self.GasReserve,
+            "Insufficient vault balance to release milestone 1");
+
         send(SendParameters{
             to:    self.seller,
             value: self.m1Value,
@@ -751,7 +846,7 @@ contract EscrowVaultMilestone with Deployable {
             bounce: false
         });
         self.payReferrer();
-        self.checkVaultClose();
+        self.checkVaultClose(outbound);
     }
 
     // ─── Internal: pay referrer once on first milestone release ───────────────
@@ -787,6 +882,13 @@ contract EscrowVaultMilestone with Deployable {
             sellerShare = self.m1Value - buyerShare;
         }
 
+        let outbound: Int = buyerShare + sellerShare;
+        if (!self.referrerPaid && self.referrerFee > 0) {
+            outbound = outbound + self.referrerFee;
+        }
+        require(myBalance() >= outbound + self.GasReserve,
+            "Insufficient vault balance to resolve dispute timeout");
+
         if (buyerShare > 0) {
             send(SendParameters{
                 to: self.buyer,
@@ -806,7 +908,7 @@ contract EscrowVaultMilestone with Deployable {
         }
 
         self.payReferrer();
-        self.checkVaultClose();
+        self.checkVaultClose(outbound);
     }
 
     // ─── Internal: execute a mutually-agreed dispute settlement ───────────────
@@ -818,6 +920,13 @@ contract EscrowVaultMilestone with Deployable {
 
         let buyerShare: Int  = mValue * buyerPct / 100;
         let sellerShare: Int = mValue - buyerShare;
+
+        let outbound: Int = buyerShare + sellerShare;
+        if (sellerShare > 0 && !self.referrerPaid && self.referrerFee > 0) {
+            outbound = outbound + self.referrerFee;
+        }
+        require(myBalance() >= outbound + self.GasReserve,
+            "Insufficient vault balance to execute settlement");
 
         if (index == 0) {
             self.m0State = 2;
@@ -853,7 +962,7 @@ contract EscrowVaultMilestone with Deployable {
             self.m1DeliveryDeadline = now() + self.m1DeliveryWindow;
         }
 
-        self.checkVaultClose();
+        self.checkVaultClose(outbound);
     }
 
     // ─── Internal: close vault when ALL milestones are DONE ───────────────────
@@ -867,9 +976,21 @@ contract EscrowVaultMilestone with Deployable {
     //                          or BuyerClaimAbandoned)
     //
     // After bond send, sweeps gas residue to buyer and self-destructs.
-    fun checkVaultClose() {
+    // `reservedOutbound` is the value the caller has already queued via send() earlier
+    // in this same transaction. myBalance() is a fixed snapshot taken once at the
+    // start of compute — it does NOT fall as send() queues more actions — so a
+    // second, independent balance check here would silently re-approve funds a
+    // prior send in this same call already committed. Callers must pass in what
+    // they already spent so this guard reasons about the true combined total.
+    fun checkVaultClose(reservedOutbound: Int) {
         if (self.vaultState == 2) { return; } // double-close guard
         if (self.m0State == 2 && self.m1State == 2) {
+            // If the bond can't be afforded on top of what's already committed, the
+            // whole close (and whatever milestone action triggered it) must revert
+            // rather than skip the bond and sweep it to the buyer instead.
+            require(myBalance() >= reservedOutbound + self.performanceBond + self.GasReserve,
+                "Insufficient vault balance to close and return bond");
+
             self.vaultState = 2; // CLOSED
 
             // Return performance bond to seller if not already slashed/claimed

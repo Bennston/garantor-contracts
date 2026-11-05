@@ -15,7 +15,7 @@ describe('EscrowMilestoneFactory', () => {
     let referrer: SandboxContract<TreasuryContract>;
     let factory: SandboxContract<EscrowMilestoneFactory>;
 
-    const CREATE_VALUE = toNano('2.1');
+    const CREATE_VALUE = toNano('2.5'); // deploymentFee (1.77) + 0.6 TON gas floor, see V1-1 fix
 
     beforeAll(async () => {
         await compile('EscrowVaultMilestone');
@@ -107,7 +107,10 @@ describe('EscrowMilestoneFactory', () => {
 
         const config = await factory.getConfig();
         expect(config.totalVaultsDeployed).toBe(0n);
-        expect(config.totalFeesCollected).toBe(0n);
+        // V1-5: the retained slice of a bounced deploy (whatever isn't refunded)
+        // is now credited to totalFeesCollected instead of sitting unreachable
+        // above WithdrawFees' cap forever — so this is > 0, not exactly 0.
+        expect(config.totalFeesCollected).toBeGreaterThan(0n);
         expect(await factory.getWalletVaultCount(buyer.address, true)).toBe(0n);
         expect(await factory.getWalletVaultCount(seller.address, false)).toBe(0n);
         expect(await factory.getReferrerVaultCount(referrer.address)).toBe(0n);

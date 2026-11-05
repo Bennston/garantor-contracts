@@ -32,7 +32,30 @@ npm test            # run the sandbox test suite
 
 ## Audit status
 
-The V1 escrow contracts are live on TON Mainnet. The V2 jetton contracts and V3 oracle marketplace are currently **testnet-only and have not yet completed an external security audit** — treat them as a preview, not production-ready, until that audit is complete. This repo will be updated as audit status changes.
+**Independent external security audits run on a regular, continuous cadence, and
+reports are published in this repo as they complete.**
+
+**Internal audit (2026-11):** the complete contract set — V1 native-TON escrow
+(factories, vaults, milestone), V2 USDT-jetton escrow (regular + milestone), and
+V3 (oracle registry, oracle vault, marketplace factory + listing) — passed a full
+internal security audit. Every finding, one High through all Medium and Low items,
+was remediated and then **independently re-verified against the code**. The report,
+including the verification record, is published in
+[`audit_v3/`](./audit_v3/Garantor_V1_V2_V3_Audit_Report.md) — this repo's source
+matches the audited and remediated code. The full internal suite runs 17 test
+packages / 267 sandbox tests, fully green; the contract specs mirrored here are
+part of that suite.
+
+**Deployment status:**
+- **V1 (native-TON escrow)** — live on TON Mainnet.
+- **V2 (USDT jetton escrow)** — live on TON Mainnet.
+- **V3 (oracle + marketplace)** — live on TON Mainnet. The shipping-attestation
+  data provider (IoT/DON) is not yet activated; trades settle via buyer
+  confirmation and the dispute/arbitration path until it is. The accepted
+  single-attestor trust model and objection window are documented in the audit
+  report.
+
+This repo is updated as audit status changes.
 
 ## Scope of this repo
 
